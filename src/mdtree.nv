@@ -1,0 +1,197 @@
+// mdtree.nv — the same document as a tree, for the callers that have
+// to look backwards.
+//
+// Every body here is a `todo()`; the signatures are the design.
+
+use mdparse
+
+// WHO NEEDS A TREE.  A renderer does not: it acts on each event as it
+// arrives.  A table-of-contents builder does not either — it collects
+// headings.  What needs a tree is anything that has to look at a node's
+// SIBLINGS or its PARENT: a linter checking that a heading level does
+// not skip, a transform that unwraps a paragraph inside a tight list
+// item, a document that has to be edited and written back out.
+//
+// So the tree is built from the events rather than by a second parser.
+// There is one parser in this package, and `build` is a fold over its
+// output.  A tree that disagreed with the event stream would be a
+// second implementation of CommonMark hiding inside the first.
+//
+// THE TREE OWNS ITS TEXT AS RANGES TOO.  A node carries the same
+// `MdRange` the event did, into the same source string, which is why
+// `MdDoc` holds the source: a tree of copied strings costs the whole
+// document again, and the caller has the document.
+//
+// THE SHAPE IS A FLAT ARENA, not a linked structure of boxes.  Nodes
+// live in one list and refer to each other by index, so the tree is
+// one allocation rather than one per node, and a traversal is an index
+// walk rather than a pointer chase.  It also means a node index is
+// stable and comparable, which is what a linter reporting "this
+// heading, under that one" needs.
+
+// The index that means "there is no node here" — no parent, no next
+// sibling, no first child.
+pub const NO_NODE = 0 - 1
+
+// MdNodeKind is what a node is.
+//
+// The block and inline containers are `MdTag` — the same values the
+// event stream uses, so that a caller who learned one vocabulary knows
+// the other.  The leaves are their own variants because a leaf has no
+// `MdTag` in the event stream either.
+pub enum MdNodeKind
+    // The root.  Exactly one per document, at index 0.
+    NodeDocument
+    // A container: the tag it opened with.
+    NodeContainer(tag: mdparse.MdTag)
+    // A verbatim run of source text.
+    NodeText(text: mdparse.MdRange)
+    // One decoded character — a character reference or an escape.
+    NodeChar(ch: Int)
+    // The contents of a code span or code block.
+    NodeCode(text: mdparse.MdRange)
+    // Raw HTML the document wrote.
+    NodeHtml(text: mdparse.MdRange)
+    NodeSoftBreak
+    NodeHardBreak
+    NodeRule
+    NodeTaskMarker(checked: Bool)
+    NodeFootnoteRef(label: mdparse.MdRange)
+
+// MdNode is one node in the arena.
+pub struct MdNode
+    kind: MdNodeKind
+    // Index of the parent, or `NO_NODE` for the document root.
+    parent: Int
+    // Index of the first child, or `NO_NODE` for a leaf.
+    first_child: Int
+    // Index of the last child.  Carried so that appending during the
+    // build is not a walk, and so that a caller reading the last item
+    // of a list does not have to.
+    last_child: Int
+    // Index of the next sibling, or `NO_NODE`.
+    next_sibling: Int
+    // Index of the previous sibling, or `NO_NODE`.  The one a tree of
+    // boxes usually leaves out and a linter always wants.
+    previous_sibling: Int
+    // The byte range of the whole node in the source, opener and
+    // closer included.  What a tool that has to REPLACE a node in the
+    // original document needs, and what a diagnostic points at.
+    span: mdparse.MdRange
+
+// MdDoc is a parsed document: the arena, and the source it indexes.
+pub struct MdDoc
+    // The source the ranges point into.  Held here because a range
+    // without its string is meaningless and separating them is how a
+    // caller ends up slicing the wrong document.
+    source: Str
+    // Node 0 is the document root; every other node is reachable from
+    // it.
+    nodes: [MdNode]
+    // True when the parse hit an `MdLimits` bound.  The same flag
+    // `mdparse.parser_truncated` reports, carried onto the tree so a
+    // caller that only has the tree can still ask.
+    truncated: Bool
+
+// build parses a document into a tree, with the default options.
+//
+// ```novo
+// use mdtree
+//
+// fn main() [io]
+//     let doc = mdtree.build("# Title\n\nBody.\n")
+//     println(str.from_int(mdtree.count(doc)))
+// ```
+pub fn build(source: Str) -> MdDoc []
+    todo("markdown-nv.mdtree.build")
+
+// build_with parses with options of the caller's choosing.
+pub fn build_with(source: Str, options: mdparse.MdOptions) -> MdDoc []
+    todo("markdown-nv.mdtree.build_with")
+
+// root is the document node's index, which is always 0.
+//
+// A function rather than a constant so that a caller's traversal reads
+// the same as every other index it handles.
+pub fn root(doc: MdDoc) -> Int []
+    todo("markdown-nv.mdtree.root")
+
+// count is how many nodes the tree holds.
+pub fn count(doc: MdDoc) -> Int []
+    todo("markdown-nv.mdtree.count")
+
+// node is the node at an index.
+//
+// An index out of range is a programming error rather than a document
+// error, so this returns `?MdNode` rather than panicking: a caller
+// that built an index by arithmetic can check, and one that got it
+// from the tree cannot be wrong.
+pub fn node(doc: MdDoc, index: Int) -> ?MdNode []
+    todo("markdown-nv.mdtree.node")
+
+// children is every child index of a node, in order.
+//
+// The allocating convenience.  `MdNode.first_child` and
+// `next_sibling` are the walk that allocates nothing, and a traversal
+// in a hot path should use them.
+pub fn children(doc: MdDoc, index: Int) -> [Int] []
+    todo("markdown-nv.mdtree.children")
+
+// text is the source text a node's range names.
+pub fn text(doc: MdDoc, index: Int) -> Str []
+    todo("markdown-nv.mdtree.text")
+
+// inner_text is every text leaf under a node, concatenated.
+//
+// What a heading's anchor, a search index's excerpt and a table of
+// contents all want: the words, with the markup gone.  A code span's
+// contents ARE included — a heading that names a function in backticks
+// is about that function — and an image's alt text is included, which
+// is what an accessible excerpt means.
+pub fn inner_text(doc: MdDoc, index: Int) -> Str []
+    todo("markdown-nv.mdtree.inner_text")
+
+// headings is every heading node in document order.
+//
+// Here rather than left to the caller because a table of contents is
+// the single most common reason to build a tree at all, and because
+// the walk that gets it right — headings nested inside block quotes
+// and list items count — is the one a caller writes wrongly first.
+pub fn headings(doc: MdDoc) -> [Int] []
+    todo("markdown-nv.mdtree.headings")
+
+// links is every link and image node in document order.
+//
+// What a build-time link checker walks.  The site generator does this
+// today by searching the RENDERED HTML for `href="`, which finds the
+// href in a code sample too; a tree answers the question that was
+// actually being asked.
+pub fn links(doc: MdDoc) -> [Int] []
+    todo("markdown-nv.mdtree.links")
+
+// code_blocks is every code block node in document order, fenced and
+// indented alike.
+//
+// For a documentation tool that compiles its examples — which is what
+// `novo doc` does to the blocks in this file.
+pub fn code_blocks(doc: MdDoc) -> [Int] []
+    todo("markdown-nv.mdtree.code_blocks")
+
+// find_first is the first node under `from` for which `keep` answers
+// true, in document order.
+//
+// A generic walk, so that the four functions above are conveniences
+// rather than the only queries there are.  `NO_NODE` when nothing
+// matches.
+pub fn find_first(doc: MdDoc, from: Int, keep: fn(MdNodeKind) -> Bool) -> Int []
+    todo("markdown-nv.mdtree.find_first")
+
+// events replays the tree as the event stream it was built from.
+//
+// The round trip, and the test that the two surfaces agree: the events
+// out of this function are the events `mdparse` produced, in the same
+// order.  It is also how a caller that transformed the tree renders
+// it — `mdhtml` takes events, so a transformed tree renders through
+// the same renderer as an untransformed document.
+pub fn events(doc: MdDoc) -> [mdparse.MdEvent] []
+    todo("markdown-nv.mdtree.events")

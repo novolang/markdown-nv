@@ -1,0 +1,361 @@
+// mdparse.nv — CommonMark as a pull parser: events out, one at a
+// time, over a source string the caller keeps.
+//
+// Every body here is a `todo()`; the signatures are the design.
+
+use uclass
+use ucase
+
+// WHY A PULL PARSER AND NOT A TREE.  A renderer, a table-of-contents
+// builder, a link checker and a search indexer all want to walk the
+// document once and act on what goes past.  A tree makes every one of
+// them allocate the whole document first, and the site generator that
+// asked for this package renders 58 pages per build.  The tree is
+// `mdtree`, built from these events, for the callers that genuinely
+// need to look backwards.
+//
+// EVERY EVENT CARRIES A BYTE RANGE, NOT A STRING.  `MdRange` is an
+// offset pair into the source the caller already holds, so the parser
+// allocates nothing per event and a caller that wants the text slices
+// it.  That is the difference between a parser that can be `core` and
+// one that cannot.
+//
+// THE HONEST EXCEPTION IS `MdChar`.  Some text in a Markdown document
+// is not a substring of the document: `&amp;` is one ampersand,
+// `\*` is one asterisk, and neither appears in the source as the
+// character it means.  A parser that returned only ranges would have
+// to lie about those, and one that returned strings would allocate for
+// every document.  So there are two text events — `MdText(MdRange)`
+// for the verbatim runs and `MdChar(Int)` for the decoded ones — and a
+// renderer handles both.  pulldown-cmark solves the same problem with
+// a copy-on-write string; this is the same answer without the string.
+//
+// CommonMark HAS NO PARSE ERRORS.  Every sequence of bytes is a valid
+// document, so there is no error type here and no `Result` anywhere.
+// What there is instead is a bounded machine: `MdLimits` caps the
+// nesting depth and the number of open blocks, a document that exceeds
+// them has the excess rendered as literal text, and
+// `parser_truncated` says so afterwards. A `core` parser with an
+// unbounded recursion is a `core` parser with a stack overflow.
+
+// MdRange is a byte range into the source the caller holds.
+//
+// `start` inclusive, `end` exclusive.  An empty range — `start` equal
+// to `end` — is how an event that has no text of its own reports its
+// position, which is what a caller building source maps needs.
+pub struct MdRange
+    start: Int
+    end: Int
+
+// MdListKind says what kind of list an item belongs to.
+pub enum MdListKind
+    // A bullet list, and which character opened it — `-`, `+` or `*`.
+    // The character matters: CommonMark ends a list and starts a new
+    // one when it changes.
+    ListBullet(marker: Int)
+    // An ordered list, its first number and its delimiter (`.` or
+    // `)`).  The start number is carried because `<ol start="7">` is
+    // what a document beginning at 7 means.
+    ListOrdered(start: Int, delimiter: Int)
+
+// MdCodeKind says how a code block was written.
+pub enum MdCodeKind
+    // Fenced, with its info string — the "novo" in ```novo.  Empty
+    // when there was none.
+    CodeFenced(info: MdRange)
+    // Indented by four spaces.  No info string, ever.
+    CodeIndented
+
+// MdAlign is a GFM table column's alignment, from its delimiter row.
+pub enum MdAlign
+    AlignNone
+    AlignLeft
+    AlignCentre
+    AlignRight
+
+// MdLink is the destination and title of a link or an image.
+//
+// Both are ranges into the source, EXCEPT when the destination came
+// from a link reference definition elsewhere in the document — then
+// the range points at the definition rather than at the use, which is
+// what lets a caller report where a broken link was defined.
+pub struct MdLink
+    destination: MdRange
+    // Empty when the link had no title.
+    title: MdRange
+    // True when the destination came from a reference definition
+    // rather than from the brackets at the point of use.  A link
+    // checker wants to know; a renderer does not.
+    from_reference: Bool
+
+// MdTag is a container that opens and closes.
+//
+// Every `MdTag` appears twice in the event stream — once in
+// `MdStart` and once in `MdEnd` — and the two always match, even when
+// the document did not close what it opened.  That invariant is what
+// lets a renderer keep no stack of its own.
+pub enum MdTag
+    TagParagraph
+    // An ATX or setext heading, its level 1 to 6, and the explicit
+    // anchor a `{#id}` suffix gave it — empty when there was none.
+    // Pandoc's anchor syntax rather than CommonMark's, because the
+    // documentation this package has to render uses it.
+    TagHeading(level: Int, anchor: MdRange)
+    TagBlockQuote
+    TagCodeBlock(kind: MdCodeKind)
+    // A list, and whether it is loose — a loose list wraps its items'
+    // contents in paragraphs and a tight one does not, which is the
+    // rule that cannot be decided until the list has ended.
+    TagList(kind: MdListKind, loose: Bool)
+    TagItem
+    // A GFM table and its columns' alignments, read from the
+    // delimiter row.
+    TagTable(alignments: [MdAlign])
+    TagTableHead
+    TagTableRow
+    TagTableCell
+    TagEmphasis
+    TagStrong
+    // GFM strikethrough, `~~like this~~`.
+    TagStrikethrough
+    TagLink(link: MdLink)
+    TagImage(link: MdLink)
+    // A GFM footnote definition and its label.
+    TagFootnoteDefinition(label: MdRange)
+
+// MdEvent is one thing the parser found.
+pub enum MdEvent
+    // A container opened.
+    MdStart(tag: MdTag)
+    // A container closed.  The tag is the one that opened it.
+    MdEnd(tag: MdTag)
+    // A verbatim run of source text.
+    MdText(text: MdRange)
+    // One decoded character: a character reference like `&amp;`, or a
+    // backslash escape.  The honest half of the zero-copy design.
+    MdChar(ch: Int)
+    // The contents of a code span or a code block, verbatim.
+    // Separate from `MdText` because nothing inside it is markup and a
+    // renderer must not look for any.
+    MdCode(text: MdRange)
+    // Raw HTML the document wrote.  A renderer decides whether to
+    // emit it or escape it, and `mdhtml`'s default is to escape —
+    // see that module's comment for why.
+    MdHtml(text: MdRange)
+    // A line ending inside a paragraph.  A renderer emits a space or a
+    // newline; it is NOT a paragraph break.
+    MdSoftBreak
+    // Two trailing spaces or a trailing backslash: `<br>`.
+    MdHardBreak
+    // A thematic break — `---`, `***`, `___`.
+    MdRule
+    // A GFM task list marker at the start of an item, and whether it
+    // was checked.
+    MdTaskMarker(checked: Bool)
+    // A GFM footnote reference and its label.
+    MdFootnoteRef(label: MdRange)
+
+// MdLimits bounds what the parser will do, so that a `core` parser
+// cannot be made to overflow its stack by a document.
+pub struct MdLimits
+    // How deeply containers may nest — block quotes inside lists
+    // inside block quotes.  Beyond it, the opener is literal text.
+    max_nesting: Int
+    // How many link reference definitions are remembered.  A document
+    // with more is not refused; the ones past the cap do not resolve,
+    // and `parser_truncated` is true.
+    max_reference_definitions: Int
+    // How many delimiters the emphasis matcher will hold open.  The
+    // pathological CommonMark inputs are all a long run of `*`.
+    max_delimiters: Int
+
+// MdOptions turns the extensions on and off.
+//
+// Every one of them is off by default except tables, because tables
+// are what the row on the plan asked for and because a document with a
+// pipe table in it is not readable as CommonMark's paragraphs.
+pub struct MdOptions
+    // GFM pipe tables.  On by default.
+    tables: Bool
+    // GFM `~~strikethrough~~`.
+    strikethrough: Bool
+    // GFM `- [ ]` task list items.
+    task_lists: Bool
+    // GFM footnotes, `[^1]`.
+    footnotes: Bool
+    // GFM autolinks: a bare URL becomes a link.  Off by default
+    // because it changes the meaning of text nobody marked up.
+    autolinks: Bool
+    // Pandoc's `{#id}` heading anchors.  On by default, because the
+    // documentation this package exists to render uses them and
+    // because the syntax is inert in a renderer that ignores it.
+    heading_anchors: Bool
+    // Smart punctuation: quotes to curly ones, `--` to an en dash.
+    // Off by default.  A renderer that rewrites a user's punctuation
+    // inside a code sample is a renderer that corrupts code samples.
+    smart_punctuation: Bool
+    limits: MdLimits
+
+// MdParser is the parser's whole state.
+//
+// A value, so a caller can keep one and come back to it — which is
+// what a streaming consumer and a test that wants to replay a
+// document both need.
+pub struct MdParser
+    // The document being parsed.  Held so that `next` takes one
+    // argument, and so that a parser cannot be used against a
+    // different string by accident.
+    source: Str
+    options: MdOptions
+    // The byte offset the block scanner has reached.
+    at: Int
+    // How deep the open containers are, against `limits.max_nesting`.
+    depth: Int
+    // True once a limit has been reached.  Read it with
+    // `parser_truncated` after the walk.
+    truncated: Bool
+
+// MdStep is one event and the parser that follows it.
+pub struct MdStep
+    parser: MdParser
+    event: MdEvent
+
+// default_limits are bounds no real document reaches and no
+// adversarial one gets past: 64 levels of nesting, 4096 reference
+// definitions, 4096 open delimiters.
+pub fn default_limits() -> MdLimits []
+    todo("markdown-nv.mdparse.default_limits")
+
+// commonmark_options is strict CommonMark: every extension off,
+// including tables.
+//
+// The configuration the spec's own test suite is run under, and the
+// one to use when the output has to be comparable with another
+// implementation.
+pub fn commonmark_options() -> MdOptions []
+    todo("markdown-nv.mdparse.commonmark_options")
+
+// default_options is CommonMark plus tables plus heading anchors.
+//
+// What the row on the plan asked for, and what the documentation this
+// package renders is written in.
+pub fn default_options() -> MdOptions []
+    todo("markdown-nv.mdparse.default_options")
+
+// gfm_options is every GitHub Flavored Markdown extension on.
+pub fn gfm_options() -> MdOptions []
+    todo("markdown-nv.mdparse.gfm_options")
+
+// parser starts a walk over a document with the default options.
+//
+// ```novo
+// use mdparse
+//
+// fn main() [io]
+//     var p = mdparse.parser("# Title\n\nSome *text*.\n")
+//     var going = true
+//     while going
+//         match mdparse.next(p)
+//             None       =>
+//                 going = false
+//             Some(step) =>
+//                 p = step.parser
+// ```
+pub fn parser(source: Str) -> MdParser []
+    todo("markdown-nv.mdparse.parser")
+
+// parser_with starts a walk with options of the caller's choosing.
+pub fn parser_with(source: Str, options: MdOptions) -> MdParser []
+    todo("markdown-nv.mdparse.parser_with")
+
+// next is the next event, or `None` at the end of the document.
+//
+// **The load-bearing interface.**  One event at a time, over a source
+// the caller holds, with the parser returned rather than mutated — so
+// a caller can look at an event and decide not to consume it, which is
+// what a renderer needs when it has to look one event ahead to decide
+// whether a list is tight.
+pub fn next(p: MdParser) -> ?MdStep []
+    todo("markdown-nv.mdparse.next")
+
+// parser_truncated answers whether a limit was reached.
+//
+// CommonMark has no parse errors, so this is the only thing a parser
+// can tell a caller that went wrong — and something did go wrong, in
+// the sense that the output does not match what the document said.
+// Ask it after the walk; a caller that never asks gets a rendering
+// with the deep parts as literal text, which is the safe failure.
+pub fn parser_truncated(p: MdParser) -> Bool []
+    todo("markdown-nv.mdparse.parser_truncated")
+
+// slice is the text a range names.
+//
+// The one function a caller needs to turn an event into text, here
+// rather than left to `str.slice` at every call site because a range
+// is meaningless without the source it came from and this is the
+// function that pairs them.
+pub fn slice(p: MdParser, r: MdRange) -> Str []
+    todo("markdown-nv.mdparse.slice")
+
+// line_of is the 1-based line number a byte offset falls on.
+//
+// For a link checker or a linter reporting where something is.  Linear
+// in the offset, so a caller reporting many positions should collect
+// them and ask once — `line_starts` is that function.
+pub fn line_of(p: MdParser, offset: Int) -> Int []
+    todo("markdown-nv.mdparse.line_of")
+
+// line_starts is the byte offset of every line in the document.
+//
+// Built once, then binary-searched: the shape a tool reporting a
+// hundred positions wants, where `line_of` would be quadratic.
+pub fn line_starts(p: MdParser) -> [Int] []
+    todo("markdown-nv.mdparse.line_starts")
+
+// reference_definitions is every link reference definition the
+// document declared, as label-and-destination pairs.
+//
+// Available before the walk finishes, because CommonMark resolves a
+// reference to a definition ANYWHERE in the document — including one
+// that comes later — so the parser has to scan for them first anyway.
+// A link checker wants the list; a renderer does not.
+pub fn reference_definitions(p: MdParser) -> [MdRange] []
+    todo("markdown-nv.mdparse.reference_definitions")
+
+// ── The three places CommonMark is defined in terms of Unicode ───────
+//
+// They are published rather than kept private because they are the
+// whole of why this package depends on unicode-nv, and because a
+// consumer comparing this parser with another one needs to be able to
+// ask the same questions this parser asked.
+
+// is_unicode_whitespace is CommonMark's "Unicode whitespace
+// character": `uclass.is_whitespace`, and nothing else.
+//
+// It appears in the left- and right-flanking definitions, which decide
+// whether a `*` opens emphasis, closes it, or is literal.  A parser
+// that used ASCII whitespace here renders `*a*` and a non-breaking
+// space differently from every conforming implementation.
+pub fn is_unicode_whitespace(ch: Int) -> Bool []
+    todo("markdown-nv.mdparse.is_unicode_whitespace")
+
+// is_unicode_punctuation is CommonMark's "Unicode punctuation
+// character": the P categories AND the S categories, which is
+// `uclass.is_punctuation(ch) or uclass.is_symbol(ch)`.
+//
+// The "and the S categories" half is the part implementations get
+// wrong — it was added in CommonMark 0.30 — and it is why this package
+// calls two of unicode-nv's predicates rather than one.
+pub fn is_unicode_punctuation(ch: Int) -> Bool []
+    todo("markdown-nv.mdparse.is_unicode_punctuation")
+
+// reference_label_key is the matching key for a link reference label.
+//
+// CommonMark § 4.7 matches labels after stripping, collapsing internal
+// whitespace, and **Unicode case folding** — so `[FOO]` finds
+// `[foo]: /url` and `[STRASSE]` finds `[straße]: /url`.  That last one
+// is `ucase.fold`, and it is the second reason this package depends on
+// unicode-nv: `str.lower` gets it wrong on exactly the input the spec
+// singles out.
+pub fn reference_label_key(p: MdParser, label: MdRange) -> Str []
+    todo("markdown-nv.mdparse.reference_label_key")

@@ -1,0 +1,20 @@
+# Build outputs.
+_novo/
+
+# The generated API page.  `novo doc` writes it here so you can read
+# what the registry will serve; the registry gets its own copy,
+# uploaded beside the archive by `novo pkg publish`.  It is generated
+# from the sources, so committing it would be committing a second
+# original.
+APIDOC.md
+
+# The built package binary.  This package is a LIBRARY and builds none;
+# the line is here for when it grows a `main`.
+/markdown-nv
+
+# The resolved dependency closure.  It is ignored HERE, and only here,
+# because this package's one dependency is a sibling by path while the
+# two are developed together — so the lock names a directory in this
+# tree and would be wrong on every other machine.  It becomes a
+# registry range at publish, and the lock becomes worth committing.
+novo.lock

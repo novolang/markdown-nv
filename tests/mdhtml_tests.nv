@@ -1,0 +1,364 @@
+// mdhtml_tests.nv — the API suite for the HTML renderer.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: markdown-nv.mdhtml.<fn>`.
+//
+// THE CASES ARE THE COMMONMARK SPEC's OWN.  Each one below is an
+// example from the spec (0.31.2) or from the GitHub Flavored Markdown
+// spec, quoted as input-and-output and named by the section it is in,
+// and every one of them is run under `commonmark_options()` — the
+// configuration in which this renderer is supposed to agree with the
+// spec exactly.  The whole appendix — 652 examples — becomes a
+// generated suite beside this one when the implementation lands;
+// these are the ones that explain what the rules are for.
+//
+// THE LAST TWO TESTS ARE NOT FROM THE SPEC and are the ones that
+// matter most: they check the two places this renderer deliberately
+// DISAGREES with CommonMark, because CommonMark's answer is the unsafe
+// one when the document came from somebody else.
+
+use std.test
+use std.list
+use mdparse
+use mdtree
+use mdhtml
+
+@test
+fn test_atx_headings_follow_the_spec_exactly() [io]
+    let o = mdhtml.commonmark_options()
+
+    test.case("ATX headings — `# foo`")
+    test.assert(mdhtml.render_str("# foo\n", o) == "<h1>foo</h1>\n")
+    test.assert(mdhtml.render_str("###### foo\n", o) == "<h6>foo</h6>\n")
+
+    test.case("seven hashes is not a heading")
+    test.assert(mdhtml.render_str("####### foo\n", o) == "<p>####### foo</p>\n")
+
+    test.case("and neither is a hash with no space after it")
+    test.assert(mdhtml.render_str("#5 bolt\n", o) == "<p>#5 bolt</p>\n")
+
+    test.case("a closing sequence is optional and is not content")
+    test.assert(mdhtml.render_str("## foo ##\n", o) == "<h2>foo</h2>\n")
+
+@test
+fn test_setext_headings_and_thematic_breaks() [io]
+    let o = mdhtml.commonmark_options()
+
+    test.case("Setext headings — an underline of `=` or `-`")
+    test.assert(mdhtml.render_str("Foo\n===\n", o) == "<h1>Foo</h1>\n")
+    test.assert(mdhtml.render_str("Foo\n---\n", o) == "<h2>Foo</h2>\n")
+
+    test.case("Thematic breaks — three or more of `*`, `-` or `_`")
+    test.assert(mdhtml.render_str("***\n", o) == "<hr />\n")
+    test.assert(mdhtml.render_str("___\n", o) == "<hr />\n")
+
+    test.case("two is not enough, and stays a paragraph")
+    test.assert(mdhtml.render_str("**\n", o) == "<p>**</p>\n")
+
+@test
+fn test_the_emphasis_rules_are_about_flanking_not_about_pairs() [io]
+    // The section every implementation gets wrong, and the reason this
+    // package depends on unicode-nv: "left-flanking" is defined in
+    // terms of Unicode whitespace and Unicode punctuation.
+    let o = mdhtml.commonmark_options()
+
+    test.case("Emphasis and strong emphasis — the simple cases")
+    test.assert(mdhtml.render_str("*foo bar*\n", o) == "<p><em>foo bar</em></p>\n")
+    test.assert(mdhtml.render_str("**foo bar**\n", o)
+                == "<p><strong>foo bar</strong></p>\n")
+
+    test.case("a `*` followed by whitespace is not left-flanking")
+    test.assert(mdhtml.render_str("a * foo bar*\n", o) == "<p>a * foo bar*</p>\n")
+    test.assert(mdhtml.render_str("** foo bar**\n", o) == "<p>** foo bar**</p>\n")
+
+    test.case("but an asterisk inside a word IS — `5*6*78`")
+    test.assert(mdhtml.render_str("5*6*78\n", o) == "<p>5<em>6</em>78</p>\n")
+
+    test.case("and an underscore inside a word is NOT — that is the whole difference")
+    test.assert(mdhtml.render_str("foo_bar_baz\n", o) == "<p>foo_bar_baz</p>\n")
+    test.assert(mdhtml.render_str("_foo bar_\n", o) == "<p><em>foo bar</em></p>\n")
+
+    test.case("an underscore after punctuation can open — `foo-_(bar)_`")
+    test.assert(mdhtml.render_str("foo-_(bar)_\n", o)
+                == "<p>foo-<em>(bar)</em></p>\n")
+
+@test
+fn test_code_spans_and_fenced_blocks() [io]
+    let o = mdhtml.commonmark_options()
+
+    test.case("Code spans — a backtick run is closed by a run of the same length")
+    test.assert(mdhtml.render_str("`foo`\n", o) == "<p><code>foo</code></p>\n")
+
+    test.case("a longer run lets a backtick be content — ``` `` ` `` ```")
+    test.assert(mdhtml.render_str("`` ` ``\n", o) == "<p><code>`</code></p>\n")
+
+    test.case("one leading and one trailing space are stripped, and only one")
+    test.assert(mdhtml.render_str("` foo `\n", o) == "<p><code>foo</code></p>\n")
+
+    test.case("Fenced code blocks — the info string becomes a language class")
+    test.assert(mdhtml.render_str("```ruby\nx = 1\n```\n", o)
+                == "<pre><code class=\"language-ruby\">x = 1\n</code></pre>\n")
+
+    test.case("and nothing inside a code block is markup")
+    test.assert(mdhtml.render_str("```\n*not emphasis*\n```\n", o)
+                == "<pre><code>*not emphasis*\n</code></pre>\n")
+
+@test
+fn test_entities_and_backslash_escapes_are_not_substrings() [io]
+    // The reason `MdChar` exists beside `MdText`: neither of these
+    // appears in the source as the character it means, so a parser
+    // that returned only byte ranges would have to lie.
+    let o = mdhtml.commonmark_options()
+
+    test.case("Entity and numeric character references")
+    test.assert(mdhtml.render_str("&amp;\n", o) == "<p>&amp;</p>\n")
+    test.assert(mdhtml.render_str("&#35;\n", o) == "<p>#</p>\n")
+    test.assert(mdhtml.render_str("&#X22;\n", o) == "<p>&quot;</p>\n")
+
+    test.case("a reference that is not one stays as text")
+    test.assert(mdhtml.render_str("&nosuchentity;\n", o)
+                == "<p>&amp;nosuchentity;</p>\n")
+
+    test.case("Backslash escapes — a punctuation mark loses its meaning")
+    test.assert(mdhtml.render_str("\\*not emphasized*\n", o)
+                == "<p>*not emphasized*</p>\n")
+
+    test.case("but a backslash before a letter is a backslash")
+    test.assert(mdhtml.render_str("\\a\n", o) == "<p>\\a</p>\n")
+
+@test
+fn test_links_inline_and_by_reference() [io]
+    let o = mdhtml.commonmark_options()
+
+    test.case("Links — an inline link with a title")
+    test.assert(mdhtml.render_str("[link](/uri \"title\")\n", o)
+                == "<p><a href=\"/uri\" title=\"title\">link</a></p>\n")
+
+    test.case("a reference link resolves to a definition ANYWHERE in the document")
+    test.assert(mdhtml.render_str("[foo][bar]\n\n[bar]: /url \"t\"\n", o)
+                == "<p><a href=\"/url\" title=\"t\">foo</a></p>\n")
+
+    test.case("and the label match is case-folded, which is ucase.fold's case")
+    test.assert(mdhtml.render_str("[FOO]\n\n[foo]: /url\n", o)
+                == "<p><a href=\"/url\">FOO</a></p>\n")
+
+    test.case("Images — the same syntax with a bang, and alt text from the label")
+    test.assert(mdhtml.render_str("![alt](/img.png)\n", o)
+                == "<p><img src=\"/img.png\" alt=\"alt\" /></p>\n")
+
+@test
+fn test_breaks_blockquotes_and_lists() [io]
+    let o = mdhtml.commonmark_options()
+
+    test.case("Hard line breaks — two trailing spaces")
+    test.assert(mdhtml.render_str("foo  \nbaz\n", o) == "<p>foo<br />\nbaz</p>\n")
+
+    test.case("Soft line breaks are a newline, not a paragraph break")
+    test.assert(mdhtml.render_str("foo\nbaz\n", o) == "<p>foo\nbaz</p>\n")
+
+    test.case("Block quotes")
+    test.assert(mdhtml.render_str("> foo\n", o)
+                == "<blockquote>\n<p>foo</p>\n</blockquote>\n")
+
+    test.case("Lists — a tight list does not wrap its items in paragraphs")
+    test.assert(mdhtml.render_str("- a\n- b\n", o)
+                == "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n")
+
+    test.case("and a loose one does — the blank line is the whole difference")
+    test.assert(mdhtml.render_str("- a\n\n- b\n", o)
+                == "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n</ul>\n")
+
+    test.case("an ordered list keeps the number it started at")
+    test.assert(mdhtml.render_str("7. a\n8. b\n", o)
+                == "<ol start=\"7\">\n<li>a</li>\n<li>b</li>\n</ol>\n")
+
+@test
+fn test_gfm_tables_are_the_extension_the_plan_asked_for() [io]
+    // From the GitHub Flavored Markdown spec, § Tables (extension).
+    var o = mdhtml.commonmark_options()
+
+    test.case("a header row, a delimiter row, and a body row")
+    let simple = "| foo | bar |\n| --- | --- |\n| baz | bim |\n"
+    test.assert(mdhtml.render_str(simple, o)
+                == "<table>\n<thead>\n<tr>\n<th>foo</th>\n<th>bar</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>baz</td>\n<td>bim</td>\n</tr>\n</tbody>\n</table>\n")
+
+    test.case("the delimiter row's colons are the column alignment")
+    let aligned = "| a | b | c |\n| :-- | :-: | --: |\n| 1 | 2 | 3 |\n"
+    test.assert(str.contains(mdhtml.render_str(aligned, o), "align=\"center\""))
+    test.assert(str.contains(mdhtml.render_str(aligned, o), "align=\"right\""))
+
+    test.case("a row with too few cells is padded, and too many are dropped")
+    let ragged = "| a | b |\n| - | - |\n| 1 |\n"
+    test.assert(str.contains(mdhtml.render_str(ragged, o), "<td></td>"))
+
+@test
+fn test_raw_html_is_escaped_by_default_and_that_is_not_commonmark() [io]
+    // THE FIRST DELIBERATE DISAGREEMENT.  CommonMark says to pass raw
+    // HTML through.  A renderer whose input is a README somebody
+    // published is a renderer whose input is hostile, and passing
+    // `<script>` through is that document running code on the reader's
+    // origin.
+    let safe = mdhtml.default_options()
+    let spec = mdhtml.commonmark_options()
+
+    test.case("the spec's answer passes the tag through")
+    test.assert(str.contains(mdhtml.render_str("<em>x</em>\n", spec), "<em>x</em>"))
+
+    test.case("the default escapes it, so it reads as the text it was written as")
+    test.assert(str.contains(mdhtml.render_str("<em>x</em>\n", safe), "&lt;em&gt;"))
+
+    test.case("and a script tag never survives the default")
+    let rendered = mdhtml.render_str("<script>alert(1)</script>\n", safe)
+    test.assert(str.contains(rendered, "<script") == false)
+
+    test.case("RawDrop removes it entirely, for a plain-text summary")
+    var dropping = mdhtml.default_options()
+    dropping.raw_html = RawDrop
+    let plain = mdhtml.render_str("a<b>c\n", dropping)
+    test.assert(str.contains(plain, "b") == false)
+
+@test
+fn test_the_url_rule_is_a_value_and_the_default_is_the_registry_s() [io]
+    // THE SECOND DELIBERATE DISAGREEMENT, and the dogfood: this is the
+    // novo-lang registry's own `safe_href`, which is twenty lines in
+    // `orbit/website/src/packages.nv` today.
+    let safe = mdhtml.default_options()
+    let spec = mdhtml.commonmark_options()
+
+    test.case("a javascript: destination is refused by the default rule")
+    let out = mdhtml.render_str("[x](javascript:alert(1))\n", safe)
+    test.assert(str.contains(out, "javascript:") == false)
+    test.assert(str.contains(out, "href=\"#\""))
+
+    test.case("and the spec's rule allows it, which is why the default is not the spec's")
+    test.assert(str.contains(mdhtml.render_str("[x](javascript:alert(1))\n", spec),
+                             "javascript:"))
+
+    test.case("the four shapes a published document may link to all survive")
+    test.assert(str.contains(mdhtml.render_str("[x](https://e.example/)\n", safe),
+                             "https://e.example/"))
+    test.assert(str.contains(mdhtml.render_str("[x](mailto:a@e.example)\n", safe),
+                             "mailto:"))
+    test.assert(str.contains(mdhtml.render_str("[x](/docs/a.html)\n", safe),
+                             "href=\"/docs/a.html\""))
+    test.assert(str.contains(mdhtml.render_str("[x](#section)\n", safe),
+                             "href=\"#section\""))
+
+    test.case("a data: URL is refused — it is a script vector too")
+    test.assert(str.contains(mdhtml.render_str("[x](data:text/html,a)\n", safe),
+                             "data:") == false)
+
+@test
+fn test_heading_ids_are_generated_and_never_collide() [io]
+    // A documentation page without heading anchors has no deep links,
+    // and two anchors with the same id is a page where one of the
+    // links goes to the wrong place.
+    test.case("an id is generated from the text, GitHub's rule")
+    test.assert(mdhtml.heading_id("Hello There", [], "") == "hello-there")
+
+    test.case("runs of non-alphanumerics collapse to one hyphen")
+    test.assert(mdhtml.heading_id("A -- B", [], "") == "a-b")
+
+    test.case("a repeat gets a suffix rather than a duplicate")
+    test.assert(mdhtml.heading_id("Title", ["title"], "") == "title-1")
+    test.assert(mdhtml.heading_id("Title", ["title", "title-1"], "") == "title-2")
+
+    test.case("and the prefix is what keeps two documents on one page apart")
+    test.assert(mdhtml.heading_id("Title", [], "pkg-") == "pkg-title")
+
+    test.case("an explicit {#anchor} in the document wins over the generated one")
+    var o = mdhtml.default_options()
+    test.assert(str.contains(mdhtml.render_str("## Foo {#bar}\n", o), "id=\"bar\""))
+
+@test
+fn test_the_renderer_appends_rather_than_allocating() [io]
+    // The whole of why this package is `core`: a site build renders 58
+    // pages into one buffer and writes once.
+    let o = mdhtml.default_options()
+
+    test.case("the buffer comes back with the page appended")
+    let one = mdhtml.render([], "a\n", o)
+    test.assert(list.len(one) > 0)
+
+    test.case("and a second page appends to the first rather than replacing it")
+    let two = mdhtml.render(one, "b\n", o)
+    test.assert(list.len(two) > list.len(one))
+
+    test.case("escaping is public, so a caller's own text uses the same one")
+    test.assert(list.len(mdhtml.escape_text([], "a<b")) == 7)
+    test.assert(list.len(mdhtml.escape_attr([], "a\"b")) == 8)
+
+@test
+fn test_the_url_rule_is_a_named_value_a_caller_can_replace() [io]
+    // Three constructors, because three callers want three policies
+    // and the difference between them is data.
+    test.case("the supplied default refuses what it should")
+    let web = mdhtml.web_urls()
+    test.assert(web.refused == "#")
+
+    test.case("any_url allows everything, for a caller rendering its own documents")
+    var permissive = mdhtml.default_options()
+    permissive.url_rule = mdhtml.any_url()
+    test.assert(str.contains(mdhtml.render_str("[x](file:///etc/a)\n", permissive),
+                             "file:"))
+
+    test.case("and a caller builds its own from a predicate")
+    let mine = mdhtml.url_rule(only_https, "about:blank")
+    test.assert(mine.refused == "about:blank")
+    var custom = mdhtml.default_options()
+    custom.url_rule = mine
+    test.assert(str.contains(mdhtml.render_str("[x](http://e.example/)\n", custom),
+                             "about:blank"))
+
+fn only_https(url: Str) -> Bool
+    str.starts_with(url, "https://")
+
+@test
+fn test_the_other_three_renderers_are_the_same_renderer() [io]
+    // A caller that filtered the events, or that transformed a tree,
+    // finishes the job with the renderer that would have run anyway —
+    // rather than with a second one that disagrees about anything.
+    let o = mdhtml.default_options()
+    let source = "# t\n\nbody\n"
+
+    test.case("from a filtered event stream")
+    var p = mdparse.parser(source)
+    var events = []
+    var going = true
+    while going
+        match mdparse.next(p)
+            None       =>
+                going = false
+            Some(step) =>
+                events = list.push(events, step.event)
+                p = step.parser
+    let from_events = mdhtml.render_events([], p, events, o)
+    test.assert(list.len(from_events) > 0)
+
+    test.case("from one node of a tree, which is how a page renders by section")
+    let doc = mdtree.build(source)
+    let from_tree = mdhtml.render_tree([], doc, mdtree.root(doc), o)
+    test.assert(list.len(from_tree) > 0)
+
+    test.case("and to_plain is a second walk rather than the HTML with tags stripped")
+    let plain = mdhtml.to_plain([], "a `<div>` b\n", mdparse.default_options())
+    test.assert(list.len(plain) > 0)
+
+@test
+fn test_a_link_checker_reads_the_definitions_rather_than_the_output() [io]
+    // The site generator searches rendered HTML for `href="` today,
+    // which finds the href in a code sample too.
+    let p = mdparse.parser("[a][x]\n\n[x]: /url\n")
+
+    test.case("the definitions are available before the walk finishes")
+    test.assert(list.len(mdparse.reference_definitions(p)) == 1)
+
+@test
+fn test_the_tree_can_be_built_with_options_and_counted() [io]
+    test.case("strict CommonMark leaves a pipe table as a paragraph")
+    let strict = mdtree.build_with("| a |\n| - |\n", mdparse.commonmark_options())
+    test.assert(mdtree.count(strict) > 0)
+
+    test.case("and the default makes it a table, so the trees differ")
+    let tables = mdtree.build_with("| a |\n| - |\n", mdparse.default_options())
+    test.assert(mdtree.count(tables) != mdtree.count(strict))

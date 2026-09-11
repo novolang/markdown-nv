@@ -1,0 +1,210 @@
+// mdhtml.nv — events into HTML, appended to a buffer the caller owns.
+//
+// Every body here is a `todo()`; the signatures are the design.
+
+use mdparse
+use mdtree
+
+// NOTHING HERE WRITES.  Every function takes the buffer to append to
+// and returns it, so a renderer can be called in a loop over 58 pages
+// with one buffer, and a test can render a document and assert on the
+// bytes with no file anywhere.  That is also the whole of why this
+// package is `core`: the one effect in a site build is the caller's
+// single write.
+//
+// The C renderer this replaces does the opposite — it allocates a
+// fresh `char *` per call and doubles it as it goes — and the site
+// generator then concatenates the result into three more strings.
+//
+// RAW HTML IS ESCAPED BY DEFAULT, and that is the most important
+// decision in this module.  A Markdown document can contain HTML, and
+// CommonMark says to pass it through.  A renderer whose input is a
+// README somebody published is a renderer whose input is hostile, and
+// passing `<script>` through is that document running code on the
+// reader's origin.  So `MdHtmlOptions.raw_html` is `RawEscape` by
+// default; `RawPass` is what CommonMark says and is an explicit
+// opt-in, for a caller rendering its own documents.
+//
+// THE URL RULE IS THE CALLER'S, AND IT IS A VALUE.  A link's
+// destination is the one thing a document author writes that reaches
+// the page as markup rather than as text, and `javascript:` in an
+// `href` is script on the origin.  This package does not decide the
+// policy — a documentation site wants relative links, a registry wants
+// only absolute ones, a mail client wants neither — so
+// `MdHtmlOptions.url_rule` is a `fn(Str) -> Bool` the caller supplies,
+// the same way textwrap-nv takes a width rule.  `web_urls()` is the
+// supplied default and is the allow-list the novo-lang registry
+// already runs: http, https, mailto, a fragment, or a site-absolute
+// path, and everything else refused.
+
+// MdRawHtml is what the renderer does with raw HTML in the source.
+pub enum MdRawHtml
+    // Escape it, so it appears on the page as the text it was written
+    // as.  THE DEFAULT, because the common case is rendering a
+    // document somebody else wrote.
+    RawEscape
+    // Pass it through, which is what CommonMark says.  For a caller
+    // rendering documents it controls.
+    RawPass
+    // Drop it entirely — neither shown nor rendered.  For a caller
+    // producing a plain-text summary or a search index.
+    RawDrop
+
+// MdUrlRule is a rule for whether a link destination may be emitted.
+//
+// A struct around one function rather than a bare function type, so
+// the rule has a name a reader can look up, and so that a future rule
+// with more to it — a base URL to resolve against, a set of hosts —
+// is a field rather than a second parameter threaded through every
+// function here.
+pub struct MdUrlRule
+    // True to emit the destination as written, false to replace it
+    // with `refused`.
+    allows: fn(Str) -> Bool
+    // What an refused destination becomes.  `"#"` is the registry's
+    // existing answer: the link is visibly inert rather than silently
+    // removed, so a reader can see that something was there.
+    refused: Str
+
+// MdHtmlOptions is how the renderer differs from the plain one.
+pub struct MdHtmlOptions
+    raw_html: MdRawHtml
+    url_rule: MdUrlRule
+    // Prepended to every generated heading id, so that two documents
+    // rendered into one page do not collide.  Empty for none.
+    heading_id_prefix: Str
+    // Emit an `id` on every heading, generated from its text when the
+    // document gave no explicit `{#anchor}`.  On by default: a
+    // documentation page without heading anchors has no deep links.
+    heading_ids: Bool
+    // Close void elements as `<br />` rather than `<br>`.  Off by
+    // default; on for a caller producing XHTML or an EPUB.
+    xhtml: Bool
+    // Emit `<code class="language-novo">` from a fenced block's info
+    // string.  On by default — it is what every syntax highlighter
+    // reads.
+    code_language_class: Bool
+
+// web_urls is the default URL rule: the schemes a published document
+// may link to.
+//
+// `http:`, `https:`, `mailto:`, a `#` fragment, or a `/` site-absolute
+// path.  Everything else — `javascript:`, `data:`, `vbscript:`, and
+// the relative links into a repository that resolve to nothing on a
+// rendered page — becomes `#`.
+//
+// This is the novo-lang registry's own `safe_href`, which is a
+// twenty-line function in `orbit/website` today, landed here as a
+// value so that the next renderer does not write it again.
+pub fn web_urls() -> MdUrlRule []
+    todo("markdown-nv.mdhtml.web_urls")
+
+// any_url allows every destination.
+//
+// For a caller rendering its own documents, where refusing a `file:`
+// link would be refusing the thing the document is for.  Named so
+// that choosing it is visible in a review.
+pub fn any_url() -> MdUrlRule []
+    todo("markdown-nv.mdhtml.any_url")
+
+// url_rule builds a rule from a predicate.
+pub fn url_rule(allows: fn(Str) -> Bool, refused: Str) -> MdUrlRule []
+    todo("markdown-nv.mdhtml.url_rule")
+
+// default_options is the safe rendering: raw HTML escaped, `web_urls`,
+// heading ids on.
+pub fn default_options() -> MdHtmlOptions []
+    todo("markdown-nv.mdhtml.default_options")
+
+// commonmark_options is what the CommonMark spec says: raw HTML passed
+// through, every URL allowed, no heading ids.
+//
+// The configuration the spec's own 652 examples are compared under.
+// It is NOT the default, and the difference between the two is a
+// deliberate refusal to make the spec's answer the safe one.
+pub fn commonmark_options() -> MdHtmlOptions []
+    todo("markdown-nv.mdhtml.commonmark_options")
+
+// render appends a whole document's HTML to a buffer.
+//
+// The one-call form, and the one a site generator uses.
+//
+// ```novo
+// use mdhtml
+//
+// fn main() [io]
+//     // One buffer, reused across every page of a site build.
+//     let out = mdhtml.render([], "# Title\n\nBody.\n", mdhtml.default_options())
+//     println(str.from_int(list.len(out)))
+// ```
+pub fn render(out: [u8], source: Str, options: MdHtmlOptions) -> [u8] []
+    todo("markdown-nv.mdhtml.render")
+
+// render_events appends the HTML for a list of events.
+//
+// For a caller that filtered or transformed the stream — dropped the
+// first heading, rewrote every link, marked up the effect labels — and
+// wants the same renderer to finish the job.  The site generator does
+// all three of those today, by string substitution over the rendered
+// HTML.
+pub fn render_events(out: [u8], p: mdparse.MdParser, events: [mdparse.MdEvent],
+                     options: MdHtmlOptions) -> [u8] []
+    todo("markdown-nv.mdhtml.render_events")
+
+// render_tree appends the HTML for a tree, or for one node of one.
+//
+// Rendering a single node is what a caller that split a document into
+// sections needs: one call per section, into one buffer, with no
+// re-parse.
+pub fn render_tree(out: [u8], doc: mdtree.MdDoc, index: Int, options: MdHtmlOptions) -> [u8] []
+    todo("markdown-nv.mdhtml.render_tree")
+
+// render_str is `render` into a fresh string.
+//
+// The convenience for a caller that wants a `Str` and does not have a
+// buffer to reuse.  It allocates, which is the whole difference, and
+// it is here because a caller rendering one document should not have
+// to know about buffers.
+pub fn render_str(source: Str, options: MdHtmlOptions) -> Str []
+    todo("markdown-nv.mdhtml.render_str")
+
+// escape_text appends text with `&`, `<` and `>` escaped.
+//
+// The three that matter in element content.  Public because a caller
+// assembling a page around this renderer's output needs the same
+// escape for its own text, and a second implementation of it is a
+// second place to get it wrong.
+pub fn escape_text(out: [u8], text: Str) -> [u8] []
+    todo("markdown-nv.mdhtml.escape_text")
+
+// escape_attr appends text with `&`, `<`, `>`, `"` and `'` escaped.
+//
+// The two extra ones are what stops a quote in a title from ending the
+// attribute.
+pub fn escape_attr(out: [u8], text: Str) -> [u8] []
+    todo("markdown-nv.mdhtml.escape_attr")
+
+// heading_id is the anchor a heading gets.
+//
+// The document's explicit `{#id}` when it wrote one; otherwise the
+// text lowercased with runs of non-alphanumerics collapsed to a single
+// hyphen, which is the GitHub rule and the one every documentation
+// site's links are already written against.
+//
+// `seen` is every id already emitted on this page: a repeat gets `-1`,
+// `-2` and so on appended, because two headings with the same text are
+// common and two anchors with the same id are a page where one of the
+// links goes to the wrong place.
+pub fn heading_id(text: Str, seen: [Str], prefix: Str) -> Str []
+    todo("markdown-nv.mdhtml.heading_id")
+
+// to_plain appends a document's text with every construct removed.
+//
+// For a search index, an excerpt, or a terminal that wants the words.
+// Not a renderer with the tags stripped afterwards — stripping tags
+// out of HTML is how a code sample containing `<div>` ends up in a
+// search index as nothing — but a second walk of the same events, in
+// which a code block contributes its code and a link contributes its
+// text.
+pub fn to_plain(out: [u8], source: Str, options: mdparse.MdOptions) -> [u8] []
+    todo("markdown-nv.mdhtml.to_plain")

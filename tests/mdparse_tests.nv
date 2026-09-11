@@ -1,0 +1,225 @@
+// mdparse_tests.nv — the API suite for the pull parser.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`.
+//
+// WHERE mdhtml_tests.nv CHECKS WHAT THE SPEC SAYS THE OUTPUT IS, this
+// suite checks the things a pull parser promises that a renderer
+// cannot show: that an event's range points into the caller's source
+// and not at a copy, that the two text events cover the cases a range
+// alone cannot, that every `MdStart` has a matching `MdEnd` even when
+// the document did not close what it opened, and that a document
+// cannot make a `core` parser exceed its bounds.
+
+use std.test
+use std.list
+use mdparse
+
+// Every event of a document, collected.  The shape a test wants; NOT
+// the shape a renderer should use, which is to act on each event as it
+// arrives rather than to hold them all.
+fn drain(source: Str) -> [mdparse.MdEvent] [io]
+    var p = mdparse.parser(source)
+    var out = []
+    var going = true
+    while going
+        match mdparse.next(p)
+            None       =>
+                going = false
+            Some(step) =>
+                out = list.push(out, step.event)
+                p = step.parser
+    out
+
+@test
+fn test_an_event_range_points_into_the_caller_s_own_string() [io]
+    // The design claim: the parser allocates nothing per event, so a
+    // caller that wants text slices the source it already holds.  If
+    // this ever stops being true the package stops being `core` in any
+    // useful sense.
+    let source = "hello\n"
+    var p = mdparse.parser(source)
+
+    test.case("the paragraph opens")
+    match mdparse.next(p)
+        None       =>
+            test.assert(false)
+        Some(step) =>
+            test.assert(step.event == MdStart(TagParagraph))
+            p = step.parser
+
+    test.case("and the text event is a byte range, resolved against the source")
+    match mdparse.next(p)
+        None       =>
+            test.assert(false)
+        Some(step) =>
+            match step.event
+                MdText(r) =>
+                    test.assert(r.start == 0)
+                    test.assert(r.end == 5)
+                    test.assert(mdparse.slice(step.parser, r) == "hello")
+                _         =>
+                    test.assert(false)
+
+@test
+fn test_the_two_text_events_cover_what_a_range_alone_cannot() [io]
+    // `&amp;` is one ampersand and `\*` is one asterisk, and neither
+    // appears in the source as the character it means.  A parser that
+    // returned only ranges would have to lie; one that returned
+    // strings would allocate for every document.
+    test.case("a verbatim run is a range")
+    let plain = drain("ab\n")
+    test.assert(list.len(plain) == 3)
+
+    test.case("a character reference arrives as a decoded codepoint")
+    let entity = drain("&amp;\n")
+    test.assert(list.get(entity, 1) == MdChar(0x26))
+
+    test.case("and so does a backslash escape")
+    let escaped = drain("\\*\n")
+    test.assert(list.get(escaped, 1) == MdChar(0x2A))
+
+@test
+fn test_every_start_has_a_matching_end_even_when_the_document_does_not() [io]
+    // The invariant that lets a renderer keep no stack of its own.  An
+    // unclosed emphasis is not emphasis at all in CommonMark, and an
+    // unclosed block quote closes at the end of the document — either
+    // way the event stream is balanced.
+    test.case("an unterminated block quote still closes")
+    let quote = drain("> a")
+    test.assert(list.get(quote, 0) == MdStart(TagBlockQuote))
+    test.assert(list.get(quote, list.len(quote) - 1) == MdEnd(TagBlockQuote))
+
+    test.case("an unterminated emphasis produces no emphasis events at all")
+    let star = drain("*a\n")
+    test.assert(list.len(star) == 3)
+
+@test
+fn test_the_container_tags_carry_what_a_renderer_needs_to_emit_them() [io]
+    test.case("a heading carries its level")
+    let h = drain("### t\n")
+    test.assert(list.get(h, 0) == MdStart(TagHeading(3, MdRange { start: 0, end: 0 })))
+
+    test.case("an ordered list carries the number it started at")
+    let ol = drain("7. a\n")
+    match list.get(ol, 0)
+        MdStart(TagList(ListOrdered(n, _), _)) =>
+            test.assert(n == 7)
+        _                                      =>
+            test.assert(false)
+
+    test.case("a bullet list carries the marker that opened it")
+    let ul = drain("+ a\n")
+    match list.get(ul, 0)
+        MdStart(TagList(ListBullet(m), _)) =>
+            test.assert(m == 0x2B)
+        _                                  =>
+            test.assert(false)
+
+    test.case("a fenced block carries its info string as a range")
+    let code = drain("```novo\nx\n```\n")
+    match list.get(code, 0)
+        MdStart(TagCodeBlock(CodeFenced(info))) =>
+            test.assert(info.start == 3)
+            test.assert(info.end == 7)
+        _                                       =>
+            test.assert(false)
+
+@test
+fn test_loose_and_tight_is_decided_when_the_list_ends_not_when_it_opens() [io]
+    // The one place a pull parser has to look ahead, and the reason
+    // `next` returns the parser rather than mutating it.
+    test.case("a tight list says so on the tag that opened it")
+    let tight = drain("- a\n- b\n")
+    test.assert(list.get(tight, 0) == MdStart(TagList(ListBullet(0x2D), false)))
+
+    test.case("and a loose one says so on the same tag")
+    let loose = drain("- a\n\n- b\n")
+    test.assert(list.get(loose, 0) == MdStart(TagList(ListBullet(0x2D), true)))
+
+@test
+fn test_the_parser_is_bounded_and_reports_when_a_bound_was_reached() [io]
+    // CommonMark has no parse errors — every byte sequence is a valid
+    // document — so this is the only thing the parser can tell a caller
+    // went wrong.  A `core` parser with unbounded recursion is a `core`
+    // parser with a stack overflow, and the pathological inputs are all
+    // one line long.
+    test.case("an ordinary document is not truncated")
+    var p = mdparse.parser("a\n")
+    test.assert(mdparse.parser_truncated(p) == false)
+
+    test.case("the default bounds are ones no real document reaches")
+    let l = mdparse.default_limits()
+    test.assert(l.max_nesting == 64)
+    test.assert(l.max_delimiters > 0)
+
+    test.case("a document past the nesting bound renders the excess as text")
+    var tight = mdparse.default_options()
+    tight.limits = MdLimits { max_nesting: 2, max_reference_definitions: 4,
+                              max_delimiters: 4 }
+    var deep = mdparse.parser_with("> > > > a\n", tight)
+    var going = true
+    while going
+        match mdparse.next(deep)
+            None       =>
+                going = false
+            Some(step) =>
+                deep = step.parser
+    test.assert(mdparse.parser_truncated(deep))
+
+@test
+fn test_the_options_are_three_named_configurations_not_a_pile_of_flags() [io]
+    test.case("strict CommonMark has every extension off, tables included")
+    let spec = mdparse.commonmark_options()
+    test.assert(spec.tables == false)
+    test.assert(spec.heading_anchors == false)
+    test.assert(spec.smart_punctuation == false)
+
+    test.case("the default is CommonMark plus tables plus heading anchors")
+    let d = mdparse.default_options()
+    test.assert(d.tables)
+    test.assert(d.heading_anchors)
+    test.assert(d.autolinks == false)
+    test.assert(d.smart_punctuation == false)
+
+    test.case("and GFM turns the GitHub extensions on")
+    let gfm = mdparse.gfm_options()
+    test.assert(gfm.tables)
+    test.assert(gfm.strikethrough)
+    test.assert(gfm.task_lists)
+    test.assert(gfm.footnotes)
+    test.assert(gfm.autolinks)
+
+@test
+fn test_the_three_unicode_questions_are_published_because_the_spec_asks_them() [io]
+    // They are the whole of why this package depends on unicode-nv, and
+    // a consumer comparing this parser with another one has to be able
+    // to ask the same questions it asked.
+    test.case("CommonMark's Unicode whitespace is the White_Space property")
+    test.assert(mdparse.is_unicode_whitespace(0x0020))
+    test.assert(mdparse.is_unicode_whitespace(0x00A0))
+    test.assert(mdparse.is_unicode_whitespace(0x0061) == false)
+
+    test.case("its Unicode punctuation is the P categories AND the S categories")
+    test.assert(mdparse.is_unicode_punctuation(0x002E))
+    test.assert(mdparse.is_unicode_punctuation(0x002B))
+    test.assert(mdparse.is_unicode_punctuation(0x0061) == false)
+
+    test.case("and a reference label's key is case-FOLDED, not lowercased")
+    let p = mdparse.parser("[stra\u{00DF}e]: /url\n")
+    test.assert(mdparse.reference_label_key(p, MdRange { start: 1, end: 8 })
+                == "strasse")
+
+@test
+fn test_positions_are_answered_two_ways_for_two_kinds_of_caller() [io]
+    let source = "a\nb\nc\n"
+    let p = mdparse.parser(source)
+
+    test.case("one position at a time, for a single diagnostic")
+    test.assert(mdparse.line_of(p, 0) == 1)
+    test.assert(mdparse.line_of(p, 2) == 2)
+    test.assert(mdparse.line_of(p, 4) == 3)
+
+    test.case("and the whole table at once, for a tool reporting a hundred")
+    let starts = mdparse.line_starts(p)
+    test.assert(list.len(starts) == 3)
+    test.assert(list.get(starts, 1) == 2)

@@ -1,0 +1,158 @@
+// mdtree_tests.nv — the API suite for the tree.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`.
+//
+// WHAT A TREE IS FOR is the whole subject here: a renderer does not
+// need one, and every test below is a question that cannot be answered
+// while walking the event stream forwards — a node's siblings, its
+// parent, the document's headings in order, and whether the tree and
+// the events agree.
+
+use std.test
+use std.list
+use mdparse
+use mdtree
+
+@test
+fn test_the_arena_is_flat_and_a_node_index_is_stable() [io]
+    // One allocation for the whole tree rather than one per node, and
+    // an index a linter can hold on to while it looks at something
+    // else.
+    let doc = mdtree.build("# t\n\nbody\n")
+
+    test.case("node 0 is the document root and has no parent")
+    test.assert(mdtree.root(doc) == 0)
+    match mdtree.node(doc, 0)
+        None    =>
+            test.assert(false)
+        Some(n) =>
+            test.assert(n.kind == NodeDocument)
+            test.assert(n.parent == NO_NODE)
+
+    test.case("the document has two block children: the heading and the paragraph")
+    test.assert(list.len(mdtree.children(doc, 0)) == 2)
+
+    test.case("an index the caller invented is refused rather than trusted")
+    test.assert(mdtree.node(doc, 9999) == None)
+    test.assert(mdtree.node(doc, 0 - 1) == None)
+
+@test
+fn test_a_node_knows_its_previous_sibling_which_is_the_whole_point() [io]
+    // The field a tree of boxes usually leaves out and a linter always
+    // wants: "is this heading's level more than one deeper than the
+    // one before it" is not answerable going forwards.
+    let doc = mdtree.build("# a\n\n### b\n")
+    let heads = mdtree.headings(doc)
+
+    test.case("two headings, in document order")
+    test.assert(list.len(heads) == 2)
+
+    test.case("and the second one can look back at the first")
+    match mdtree.node(doc, list.get(heads, 1))
+        None    =>
+            test.assert(false)
+        Some(n) =>
+            test.assert(n.previous_sibling == list.get(heads, 0))
+            test.assert(n.next_sibling == NO_NODE)
+            test.assert(n.parent == mdtree.root(doc))
+
+@test
+fn test_a_node_carries_the_span_that_a_rewrite_needs() [io]
+    // A tool that has to REPLACE a node in the original document needs
+    // the byte range of the whole node, opener and closer included —
+    // not just of its text.
+    let source = "a\n\n> q\n"
+    let doc = mdtree.build(source)
+    let kids = mdtree.children(doc, mdtree.root(doc))
+
+    test.case("the block quote's span covers its marker as well as its content")
+    match mdtree.node(doc, list.get(kids, 1))
+        None    =>
+            test.assert(false)
+        Some(n) =>
+            test.assert(n.span.start == 3)
+            test.assert(n.span.end == 7)
+
+@test
+fn test_inner_text_is_the_words_with_the_markup_gone() [io]
+    // What a heading anchor, a search excerpt and a table of contents
+    // all want.  Stripping tags out of rendered HTML is the other way
+    // to get this, and it is how a code sample containing `<div>` ends
+    // up in a search index as nothing.
+    let doc = mdtree.build("## A *bold* `fn` and [a link](/u)\n")
+    let heads = mdtree.headings(doc)
+
+    test.case("emphasis contributes its text")
+    test.assert(str.contains(mdtree.inner_text(doc, list.get(heads, 0)), "bold"))
+
+    test.case("a code span's contents are included — a heading names what it names")
+    test.assert(str.contains(mdtree.inner_text(doc, list.get(heads, 0)), "fn"))
+
+    test.case("a link contributes its text and not its destination")
+    let t = mdtree.inner_text(doc, list.get(heads, 0))
+    test.assert(str.contains(t, "a link"))
+    test.assert(str.contains(t, "/u") == false)
+
+@test
+fn test_the_four_queries_are_the_reasons_a_tree_gets_built() [io]
+    let doc = mdtree.build("# t\n\n- [a](/x)\n\n```novo\ncode\n```\n\n> ## deep\n")
+
+    test.case("headings finds the one inside the block quote too")
+    test.assert(list.len(mdtree.headings(doc)) == 2)
+
+    test.case("links finds the one inside the list item")
+    test.assert(list.len(mdtree.links(doc)) == 1)
+
+    test.case("code_blocks finds the fenced one")
+    test.assert(list.len(mdtree.code_blocks(doc)) == 1)
+
+    test.case("and find_first is the generic walk the other three are shortcuts for")
+    let first = mdtree.find_first(doc, mdtree.root(doc), is_rule)
+    test.assert(first == NO_NODE)
+
+fn is_rule(k: mdtree.MdNodeKind) -> Bool
+    match k
+        NodeRule =>
+            true
+        _        =>
+            false
+
+@test
+fn test_the_tree_replays_as_the_events_it_was_built_from() [io]
+    // The round trip, and the test that the two surfaces cannot drift:
+    // there is one parser in this package, and the tree is a fold over
+    // its output.  A tree that disagreed with the event stream would be
+    // a second implementation of CommonMark hiding inside the first.
+    let source = "# t\n\n*a*\n"
+    let doc = mdtree.build(source)
+    let replayed = mdtree.events(doc)
+
+    var p = mdparse.parser(source)
+    var direct = []
+    var going = true
+    while going
+        match mdparse.next(p)
+            None       =>
+                going = false
+            Some(step) =>
+                direct = list.push(direct, step.event)
+                p = step.parser
+
+    test.case("the same number of events")
+    test.assert(list.len(replayed) == list.len(direct))
+
+    test.case("and the same events, in the same order")
+    test.assert(list.get(replayed, 0) == list.get(direct, 0))
+    test.assert(list.get(replayed, 1) == list.get(direct, 1))
+
+@test
+fn test_the_tree_carries_the_truncation_flag_the_parser_set() [io]
+    // So that a caller who only has the tree can still ask whether the
+    // document it describes is the document that was written.
+    let doc = mdtree.build("a\n")
+
+    test.case("an ordinary document is not truncated")
+    test.assert(doc.truncated == false)
+
+    test.case("and the source is on the tree, because a range without it means nothing")
+    test.assert(doc.source == "a\n")

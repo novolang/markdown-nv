@@ -1,0 +1,67 @@
+[package]
+name        = "markdown-nv"
+version     = "0.0.1"
+description = "CommonMark plus GFM tables, as a pull parser whose events carry byte ranges into the caller's source rather than copied strings, a flat-arena tree built from the same events, and an HTML renderer that appends to a buffer the caller owns.  Raw HTML is escaped by default and a link destination is admitted by a rule the caller supplies, because the input to a Markdown renderer is usually a document somebody else wrote.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A parser over a string the caller already holds, events that
+# are pairs of integers, and a renderer that appends to the caller's
+# buffer — nothing is read, nothing is written, and the one effect in a
+# site build is the caller's single write of the finished page.
+layer       = "core"
+
+category    = "text"
+
+tags        = ["markdown", "commonmark", "gfm", "pull-parser", "html", "renderer", "pulldown-cmark", "sans-io", "zero-copy"]
+repository  = "https://github.com/novolang/markdown-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "CommonMark as a pull parser, a tree, and a renderer"
+
+[dependencies]
+# A PATH DEPENDENCY ON A SIBLING IN THIS LANE, and the coordinator
+# converts it to `^0.0.1` at publish — a path dependency is refused by
+# `novo pkg publish`, which is the rule that keeps a published tarball
+# from sending every consumer to a directory on somebody else's
+# machine.
+#
+# unicode-nv, and it is not a convenience.  CommonMark is DEFINED in
+# terms of Unicode in three places, and each of them is a place an
+# ASCII approximation renders a different document:
+#
+#   § 6.2, the left- and right-flanking rules, are written in terms of
+#   "Unicode whitespace character" and "Unicode punctuation character"
+#   — and since CommonMark 0.30 the second means the P categories AND
+#   the S categories.  Get it wrong and `*a*` renders differently from
+#   every conforming implementation.
+#
+#   § 4.7, link reference matching, compares labels after "Unicode
+#   case fold" — so `[STRASSE]` has to find `[straße]: /url`.
+#   `str.lower` gets exactly that case wrong.
+#
+#   § 2.1's definition of a character is a Unicode codepoint, which is
+#   what makes `uclass.is_valid_scalar` the check on a numeric
+#   character reference.
+#
+# `core`, so `dep-layer` holds.
+#
+# It is written as a PATH here because the two packages are developed
+# together in one tree and unicode-nv is not on the registry yet.  It
+# becomes `unicode-nv = "^0.0.1"` at publish: `novo pkg publish`
+# refuses a path dependency — `--dry-run` included — because the
+# tarball would carry the path and send every consumer to a directory
+# that is not on their machine.  Publish unicode-nv first; a package
+# cannot be published ahead of what it depends on.
+unicode-nv = "^0.0.1"
