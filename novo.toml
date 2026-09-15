@@ -1,6 +1,6 @@
 [package]
 name        = "markdown-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "CommonMark plus GFM tables, as a pull parser whose events carry byte ranges into the caller's source rather than copied strings, a flat-arena tree built from the same events, and an HTML renderer that appends to a buffer the caller owns.  Raw HTML is escaped by default and a link destination is admitted by a rule the caller supplies, because the input to a Markdown renderer is usually a document somebody else wrote.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
