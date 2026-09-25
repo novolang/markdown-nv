@@ -68,22 +68,22 @@ pub struct MdUrlRule
 
 // MdHtmlOptions is how the renderer differs from the plain one.
 pub struct MdHtmlOptions
-    raw_html: MdRawHtml
-    url_rule: MdUrlRule
+    var raw_html: MdRawHtml
+    var url_rule: MdUrlRule
     // Prepended to every generated heading id, so that two documents
     // rendered into one page do not collide.  Empty for none.
-    heading_id_prefix: Str
+    var heading_id_prefix: Str
     // Emit an `id` on every heading, generated from its text when the
     // document gave no explicit `{#anchor}`.  On by default: a
     // documentation page without heading anchors has no deep links.
-    heading_ids: Bool
+    var heading_ids: Bool
     // Close void elements as `<br />` rather than `<br>`.  Off by
     // default; on for a caller producing XHTML or an EPUB.
-    xhtml: Bool
+    var xhtml: Bool
     // Emit `<code class="language-novo">` from a fenced block's info
     // string.  On by default — it is what every syntax highlighter
     // reads.
-    code_language_class: Bool
+    var code_language_class: Bool
 
 // web_urls is the default URL rule: the schemes a published document
 // may link to.

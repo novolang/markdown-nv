@@ -5,6 +5,15 @@ All notable changes to markdown-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-09-25
+
+Every field of `MdOptions` and of `MdHtmlOptions` is now declared `var`.
+Under novo 0.10.0 a field is assigned only when it is declared that way,
+and the way to turn an extension on or change the rendering is to take
+the defaults and set the fields that differ.  This is a change to two
+public declarations, but no program that built against 0.0.2 stops
+building.  Every body is still `todo()`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

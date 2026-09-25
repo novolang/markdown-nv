@@ -176,25 +176,25 @@ pub struct MdLimits
 // pipe table in it is not readable as CommonMark's paragraphs.
 pub struct MdOptions
     // GFM pipe tables.  On by default.
-    tables: Bool
+    var tables: Bool
     // GFM `~~strikethrough~~`.
-    strikethrough: Bool
+    var strikethrough: Bool
     // GFM `- [ ]` task list items.
-    task_lists: Bool
+    var task_lists: Bool
     // GFM footnotes, `[^1]`.
-    footnotes: Bool
+    var footnotes: Bool
     // GFM autolinks: a bare URL becomes a link.  Off by default
     // because it changes the meaning of text nobody marked up.
-    autolinks: Bool
+    var autolinks: Bool
     // Pandoc's `{#id}` heading anchors.  On by default, because the
     // documentation this package exists to render uses them and
     // because the syntax is inert in a renderer that ignores it.
-    heading_anchors: Bool
+    var heading_anchors: Bool
     // Smart punctuation: quotes to curly ones, `--` to an en dash.
     // Off by default.  A renderer that rewrites a user's punctuation
     // inside a code sample is a renderer that corrupts code samples.
-    smart_punctuation: Bool
-    limits: MdLimits
+    var smart_punctuation: Bool
+    var limits: MdLimits
 
 // MdParser is the parser's whole state.
 //
