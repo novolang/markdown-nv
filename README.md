@@ -10,12 +10,6 @@ package implements CommonMark and those extensions for novo-lang, as a
 parser, a document tree and an HTML renderer. It is built on
 [unicode-nv](https://novo-lang.org/packages/unicode-nv).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What it is
 
 A **pull parser** hands out one **event** at a time and lets the caller
@@ -83,10 +77,7 @@ fn main() [io]
             None       => more = false
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: markdown-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build it with `novo pkg build` and run the suites with `novo test`.
 
 ## What the package contains
 
@@ -102,10 +93,11 @@ specification the implementation will have to satisfy.
 `mdhtml.render` appends to a buffer you own, which is what a site
 generator rendering many pages into one buffer wants.
 
-**`mdparse.parser` then `mdparse.next` is the streaming path.** Use it
+**`mdparse.parser` then `mdparse.next` is the event path.** Use it
 when you are looking for something rather than rendering: a link
-checker, a table-of-contents builder, a word count. It allocates
-nothing per event.
+checker, a table-of-contents builder, a word count. The document is
+read when the parser is made, and each step hands out one event, which
+holds no copy of the text.
 
 **`mdtree.build` is for a caller that has to look backwards.** The tree
 is a flat array of nodes with indices, so `children`, `headings`,
@@ -116,9 +108,8 @@ the tree as the event list, and `mdhtml.render_tree` renders from it.
 search index or a summary.
 
 **`mdparse.next` returns the parser rather than changing it.** A caller
-can therefore look at an event and decide not to consume it. Deciding
-whether a list is loose or tight requires looking past the end of the
-list, so this is a requirement rather than a preference.
+can therefore look at an event and decide not to consume it, or keep a
+parser and walk from it again.
 
 ## The rules a user needs
 
@@ -162,7 +153,8 @@ list, so this is a requirement rather than a preference.
    rewrites punctuation inside a code sample corrupts code samples.
 8. **`mdparse.commonmark_options()` turns every extension off,
    including tables.** It is the setting the specification suite runs
-   under.
+   under, and `mdhtml.commonmark_options()` reads the source with it.
+   `MdHtmlOptions.markdown` is how `mdhtml.render` reads a document.
 9. **Emphasis depends on Unicode character classes, not ASCII ones.**
    CommonMark section 6.2 defines a left-flanking delimiter run in
    terms of Unicode whitespace and Unicode punctuation, and since
@@ -182,6 +174,17 @@ list, so this is a requirement rather than a preference.
     generator is given the list of ones already seen and a prefix.
 13. **`mdtree.NO_NODE` is the absent index.** `MdNode`'s parent, child
     and sibling fields carry it where there is no such node.
+14. **A function that appends to a buffer takes it as a `var`
+    parameter.** The caller passes a `var` list and the same list comes
+    back, with the output after what it held.
+15. **An autolink's destination is taken as written.** Section 6.5 says
+    a backslash in one is not an escape, and no character reference is
+    decoded in it either, as the reference implementation commonmark.js
+    does.
+16. **Footnotes render where they are defined.** GFM writes them at the
+    end of the page; this renderer writes each definition in place, as
+    pulldown-cmark does, and numbers them in the order they are first
+    referenced.
 
 ## What is not included
 
@@ -205,9 +208,8 @@ list, so this is a requirement rather than a preference.
 ## Related packages
 
 - [unicode-nv](https://novo-lang.org/packages/unicode-nv) is the only
-  dependency, and it is needed for three specification rules rather
-  than for completeness: the flanking rules, link label case folding,
-  and the scalar check on a numeric character reference.
+  dependency, and it is needed for two specification rules: the
+  flanking rules and link label case folding.
 - [html-nv](https://novo-lang.org/packages/html-nv) parses and
   sanitises HTML. This package does not depend on it. Escaping five
   characters is five match arms, and a sanitising policy belongs to the
@@ -225,54 +227,32 @@ list, so this is a requirement rather than a preference.
 The reference implementation for the shape is **pulldown-cmark**: a
 pull parser, events with borrowed text, the tree as a separate concern,
 and the HTML renderer as a consumer of the events rather than the core.
-**cmark** is the reference for the tree model. **comrak** is the
-reference for the GFM extension set and for keeping the extensions as
-named options rather than a dialect.
+**cmark** is the reference for the HTML the renderer writes, byte for
+byte, and **cmark-gfm** for the GFM extensions.
 
-The oracle is the CommonMark specification's own appendix, 652 examples
-each of which is an input and the HTML it must produce, together with
-the GFM specification's table, strikethrough, task-list and footnote
-sections.
+The oracle is the CommonMark specification's own examples, each an
+input and the HTML it must produce, and the GFM specification's table,
+strikethrough and autolink examples. `tools/spec_tests.py` writes all
+of them into `tests/spec_tests.nv`, one test per section, and
+`tools/spec_run.sh` runs the same corpora through a built program and
+lists any example that differs.
 
 ```bash
-novo test --isolate tests/mdparse_tests.nv   #  9 tests: events, ranges and the bounds
-novo test --isolate tests/mdhtml_tests.nv    # 16 tests: the specification examples
-novo test --isolate tests/mdtree_tests.nv    #  7 tests: the tree, and its event replay
+novo test tests/spec_tests.nv     # 29 tests: all 652 CommonMark examples, 21 GFM ones
+novo test tests/mdparse_tests.nv  #  9 tests: events, ranges and the bounds
+novo test tests/mdhtml_tests.nv   # 16 tests: the rules, and the two safe defaults
+novo test tests/mdtree_tests.nv   #  7 tests: the tree, and its event replay
+novo test tests/edges_tests.nv    # 15 tests: the extensions, the bounds, the corners
+bash tests/coverage.sh            # line coverage over src/
 ```
 
-The suites carry the examples that explain what a rule is for. The
-generated whole-appendix suite lands with the bodies. The suite asserts
-that no event allocates, that an escaped character arrives as `MdChar`
-rather than as text, that raw HTML is escaped under the default
-options and passed under `commonmark_options`, that a `javascript:`
-destination is replaced, that a document past a bound is truncated and
-says so, that a link label matches after case folding, and that a tree
-replayed as events renders the same HTML.
-
-The tests compile today and fail at run, each on the
-`not implemented: markdown-nv.<module>.<fn>` panic that is its body.
-That is the expected state of an interface release. They turn green one
-at a time as bodies land.
-
-## Implementation status
-
-Nothing is implemented. The table lists the surface an implementation
-has to fill.
-
-| Item | Implemented |
-| --- | --- |
-| `mdtree.NO_NODE` | yes (it is a constant) |
-| `mdparse.default_limits`, `.default_options`, `.commonmark_options`, `.gfm_options` | no |
-| `mdparse.parser`, `.parser_with`, `.next`, `.parser_truncated` | no |
-| `mdparse.slice`, `.line_of`, `.line_starts`, `.reference_definitions` | no |
-| `mdparse.is_unicode_whitespace`, `.is_unicode_punctuation`, `.reference_label_key` | no |
-| `mdtree.build`, `.build_with`, `.root`, `.count`, `.node`, `.children` | no |
-| `mdtree.text`, `.inner_text`, `.find_first`, `.events` | no |
-| `mdtree.headings`, `.links`, `.code_blocks` | no |
-| `mdhtml.web_urls`, `.any_url`, `.url_rule` | no |
-| `mdhtml.default_options`, `.commonmark_options` | no |
-| `mdhtml.render`, `.render_str`, `.render_events`, `.render_tree` | no |
-| `mdhtml.escape_text`, `.escape_attr`, `.heading_id`, `.to_plain` | no |
+The suites assert that an event's range points into the caller's
+source, that an escaped character arrives as `MdChar` rather than as
+text, that raw HTML is escaped under the default options and passed
+under `commonmark_options`, that a `javascript:` destination is
+replaced, that a document past a bound is truncated and says so, that a
+link label matches after case folding, and that a tree replayed as
+events gives the events the parser produced.
 
 ## Licence
 
