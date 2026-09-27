@@ -1,0 +1,30 @@
+// spec_harness.nv — renders every example of a specification file and
+// reports the ones whose HTML differs, for tools/spec_run.sh.
+//
+// Usage: spec_harness <examples file> <commonmark|gfm>
+//
+// The examples file holds each example as `\x01number\x02markdown\x03html`.
+
+use mdparse
+use mdhtml
+
+fn main() [io, fs]
+    let args = env.user_args()
+    let data = fs.read(args[0]) ?? ""
+    var o = mdhtml.commonmark_options()
+    if list.len(args) > 1 and args[1] == "gfm"
+        o.markdown = mdparse.gfm_options()
+    var pass_count = 0
+    var fail_count = 0
+    for chunk in str.split(data, "\u{1}")
+        if chunk == ""
+            continue
+        let a = str.split(chunk, "\u{2}")
+        let b = str.split(a[1], "\u{3}")
+        let got = mdhtml.render_str(b[0], o)
+        if got == b[1]
+            pass_count = pass_count + 1
+        else
+            fail_count = fail_count + 1
+            println("FAIL ${a[0]}")
+    println("passed ${pass_count} failed ${fail_count}")

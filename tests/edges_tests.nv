@@ -1,0 +1,411 @@
+// edges_tests.nv — the extensions, the bounds, and the paths the
+// specification's examples do not reach.
+//
+// The GFM outputs follow the GFM specification's own examples for task
+// lists (section 5.3) and extended autolinks (section 6.9).  The
+// footnote markup follows pulldown-cmark, which renders a definition
+// where it stands.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use mdparse
+use mdtree
+use mdhtml
+
+fn gfm(md: Str) -> Str
+    var o = mdhtml.commonmark_options()
+    o.markdown = mdparse.gfm_options()
+    mdhtml.render_str(md, o)
+
+fn smart(md: Str) -> Str
+    var o = mdhtml.commonmark_options()
+    var m = mdparse.commonmark_options()
+    m.smart_punctuation = true
+    o.markdown = m
+    mdhtml.render_str(md, o)
+
+fn cm(md: Str) -> Str
+    mdhtml.render_str(md, mdhtml.commonmark_options())
+
+fn with_limits(nesting: Int, refs: Int, delims: Int) -> mdparse.MdOptions
+    var m = mdparse.commonmark_options()
+    m.limits = MdLimits { max_nesting: nesting, max_reference_definitions: refs,
+                          max_delimiters: delims }
+    m
+
+fn plain(md: Str) -> Str
+    var out: [u8] = []
+    mdhtml.to_plain(out, md, mdparse.gfm_options())
+    bytes.byte_list_to_str(out)
+
+fn is_image(k: mdtree.MdNodeKind) -> Bool
+    match k
+        NodeContainer(TagImage(_)) => true
+        _                          => false
+
+@test
+fn test_task_list_items_are_gfms() [io]
+    test.case("an unchecked and a checked item, as GFM section 5.3 writes them")
+    test.assert(gfm("- [ ] foo\n- [x] bar\n")
+                == "<ul>\n<li><input disabled=\"\" type=\"checkbox\"> foo</li>\n"
+                   + "<li><input checked=\"\" disabled=\"\" type=\"checkbox\"> bar</li>\n</ul>\n")
+
+    test.case("a marker needs a space after it, and only [ ], [x] and [X] are markers")
+    test.assert(gfm("- [x]bar\n- [y] z\n") == "<ul>\n<li>[x]bar</li>\n<li>[y] z</li>\n</ul>\n")
+    test.assert(str.contains(gfm("- [X] up\n"), "checked=\"\""))
+
+    test.case("a marker outside a list item is text")
+    test.assert(gfm("[ ] foo\n") == "<p>[ ] foo</p>\n")
+
+@test
+fn test_footnotes_render_where_they_are_defined() [io]
+    let doc = "Text[^1] and[^n].\n\n[^1]: The note.\n    More of it.\n\n[^n]: Second.\n"
+    let out = gfm(doc)
+
+    test.case("a reference is a numbered superscript link")
+    test.assert(str.contains(out, "<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"fnref-1\">1</a></sup>"))
+    test.assert(str.contains(out, "<a href=\"#fn-n\" id=\"fnref-n\">2</a>"))
+
+    test.case("a definition keeps its indented continuation")
+    test.assert(str.contains(out, "<div class=\"footnote-definition\" id=\"fn-1\">"
+                                  + "<sup class=\"footnote-definition-label\">1</sup>\n"
+                                  + "<p>The note.\nMore of it.</p>\n</div>\n"))
+
+    test.case("an undefined reference, an empty one and one with a space stay text")
+    test.assert(gfm("a[^x] b[^] c[^a b]\n") == "<p>a[^x] b[^] c[^a b]</p>\n")
+
+    test.case("a line that is not a footnote definition may be a link reference definition")
+    test.assert(gfm("[^a b]: x\n") == "")
+    test.assert(gfm("[^]: x\n") == "")
+    test.assert(gfm("[^a] x\n") == "<p>[^a] x</p>\n")
+
+    test.case("a definition ends at the first line that is not indented")
+    let ended = gfm("[^1]: a\n\nb\n")
+    test.assert(str.contains(ended, "</div>\n<p>b</p>\n"))
+
+    test.case("the tree holds the definition and the reference")
+    let t = mdtree.build_with("x[^1]\n\n[^1]: y\n", mdparse.gfm_options())
+    var refs = 0
+    var defs = 0
+    for n in t.nodes
+        match n.kind
+            NodeFootnoteRef(_)                      =>
+                refs = refs + 1
+            NodeContainer(TagFootnoteDefinition(_)) =>
+                defs = defs + 1
+            _                                       =>
+                pass
+    test.assert(refs == 1)
+    test.assert(defs == 1)
+
+@test
+fn test_strikethrough_is_two_tildes_or_one() [io]
+    test.case("a pair of runs of the same length strikes through")
+    test.assert(gfm("a ~~b~~ c~d~\n") == "<p>a <del>b</del> c<del>d</del></p>\n")
+
+    test.case("three tildes are not a delimiter, and runs of different lengths do not pair")
+    test.assert(gfm("x ~~~a~~~ and ~~b~\n") == "<p>x ~~~a~~~ and ~~b~</p>\n")
+
+@test
+fn test_extended_autolinks_follow_gfm() [io]
+    test.case("a www. link gets http://, and trailing punctuation stays outside")
+    test.assert(gfm("Visit www.commonmark.org.\n")
+                == "<p>Visit <a href=\"http://www.commonmark.org\">www.commonmark.org</a>.</p>\n")
+
+    test.case("an autolink must begin a word")
+    test.assert(gfm("awww.example.com\n") == "<p>awww.example.com</p>\n")
+
+    test.case("an underscore in the last two segments of the domain is not a domain")
+    test.assert(gfm("www.a_b.example.com www.a.b_c.com\n")
+                == "<p><a href=\"http://www.a_b.example.com\">www.a_b.example.com</a> www.a.b_c.com</p>\n")
+
+    test.case("the domain counts the period after www, as cmark-gfm counts it")
+    test.assert(gfm("www.localhost\n")
+                == "<p><a href=\"http://www.localhost\">www.localhost</a></p>\n")
+    test.assert(gfm("http://localhost\n") == "<p>http://localhost</p>\n")
+
+    test.case("a ; ending an entity-like word is left out, and any other ; is kept")
+    test.assert(gfm("www.a.com/x;\n") == "<p><a href=\"http://www.a.com/x;\">www.a.com/x;</a></p>\n")
+    test.assert(gfm("www.a.com/?a&b;\n") == "<p><a href=\"http://www.a.com/?a\">www.a.com/?a</a>&amp;b;</p>\n")
+
+    test.case("an email address, and one that does not begin a word")
+    test.assert(gfm("mail foo@bar.baz\n")
+                == "<p>mail <a href=\"mailto:foo@bar.baz\">foo@bar.baz</a></p>\n")
+    test.assert(gfm("x!foo@bar.baz\n") == "<p>x!foo@bar.baz</p>\n")
+    test.assert(gfm("@bar.baz\n") == "<p>@bar.baz</p>\n")
+
+    test.case("a text that starts like a scheme is not one")
+    test.assert(gfm("hello fine\n") == "<p>hello fine</p>\n")
+
+    test.case("inside a link's text an autolink stays text")
+    test.assert(gfm("[www.a.com](/x)\n") == "<p><a href=\"/x\">www.a.com</a></p>\n")
+    test.assert(gfm("[see *www.a.com*](/x)\n")
+                == "<p><a href=\"/x\">see <em>www.a.com</em></a></p>\n")
+
+@test
+fn test_smart_punctuation() [io]
+    test.case("quotes curl by the side of the word they are on")
+    test.assert(smart("\"Hello,\" she said, 'don't'\n")
+                == "<p>\u{201C}Hello,\u{201D} she said, \u{2018}don\u{2019}t\u{2019}</p>\n")
+
+    test.case("dashes by the length of the run, and three periods an ellipsis")
+    test.assert(smart("a--b---c-d----e-----f.. g...\n")
+                == "<p>a\u{2013}b\u{2014}c-d\u{2013}\u{2013}e\u{2014}\u{2013}f.. g\u{2026}</p>\n")
+    test.assert(smart("x-------y\n") == "<p>x\u{2014}\u{2013}\u{2013}y</p>\n")
+
+@test
+fn test_the_bounds_record_that_they_were_reached() [io]
+    test.case("no room for a list at all")
+    let none = mdparse.parser_with("- a\n", with_limits(0, 4, 4))
+    test.assert(mdparse.parser_truncated(none))
+
+    test.case("room for an item but not for the list around it")
+    let one = mdparse.parser_with("- a\n", with_limits(1, 4, 4))
+    test.assert(mdparse.parser_truncated(one))
+
+    test.case("no room for a footnote definition")
+    var fo = with_limits(0, 4, 4)
+    fo.footnotes = true
+    test.assert(mdparse.parser_truncated(mdparse.parser_with("[^1]: a\n", fo)))
+
+    test.case("reference definitions past the bound do not resolve")
+    let refs = mdparse.parser_with("[a]: /1\n[b]: /2\n\n[a] [b]\n", with_limits(8, 1, 4))
+    test.assert(mdparse.parser_truncated(refs))
+    var o = mdhtml.commonmark_options()
+    o.markdown = with_limits(8, 1, 4)
+    test.assert(mdhtml.render_str("[a]: /1\n[b]: /2\n\n[a] [b]\n", o)
+                == "<p><a href=\"/1\">a</a> [b]</p>\n")
+
+    test.case("delimiters past the bound are literal text")
+    let d = mdparse.parser_with("*a* *b* *c*\n", with_limits(8, 4, 2))
+    test.assert(mdparse.parser_truncated(d))
+    o.markdown = with_limits(8, 4, 2)
+    test.assert(mdhtml.render_str("*a* *b* *c*\n", o) == "<p><em>a</em> *b* *c*</p>\n")
+
+@test
+fn test_tables_start_and_end_where_gfm_says() [io]
+    test.case("text before the header row stays a paragraph")
+    test.assert(gfm("intro\n| a |\n| - |\n")
+                == "<p>intro</p>\n<table>\n<thead>\n<tr>\n<th>a</th>\n</tr>\n</thead>\n</table>\n")
+
+    test.case("a delimiter row with an empty cell, a lone colon, or one cell and no pipe is not one")
+    test.assert(gfm("| a | b |\n| - | |\n") == "<p>| a | b |\n| - | |</p>\n")
+    test.assert(gfm("| a |\n| : |\n") == "<p>| a |\n| : |</p>\n")
+    test.assert(gfm("a\n-:\n") == "<p>a\n-:</p>\n")
+    test.assert(gfm("| a |\n| x |\n") == "<p>| a |\n| x |</p>\n")
+
+    test.case("the header must have as many cells as the delimiter row")
+    test.assert(gfm("| a | b |\n| - |\n") == "<p>| a | b |\n| - |</p>\n")
+
+    test.case("an escaped pipe is text, inside a code span too")
+    test.assert(str.contains(gfm("| `a\\|b` |\n| - |\n"), "<th><code>a|b</code></th>"))
+
+    test.case("a block quote ends the table")
+    test.assert(str.contains(gfm("| a |\n| - |\n> q\n"), "</table>\n<blockquote>"))
+
+@test
+fn test_heading_anchors() [io]
+    let o = mdhtml.default_options()
+
+    test.case("an anchor after trailing spaces, in a setext heading too")
+    test.assert(mdhtml.render_str("# T {#top}  \n", o) == "<h1 id=\"top\">T</h1>\n")
+    test.assert(mdhtml.render_str("Sub {#s}\n---\n", o) == "<h2 id=\"s\">Sub</h2>\n")
+
+    test.case("what is not an anchor stays in the heading")
+    test.assert(mdhtml.render_str("# a {#b c}\n", o) == "<h1 id=\"a-b-c\">a {#b c}</h1>\n")
+    test.assert(mdhtml.render_str("# a {#}\n", o) == "<h1 id=\"a\">a {#}</h1>\n")
+    test.assert(mdhtml.render_str("# a{#x}\n", o) == "<h1 id=\"a-x\">a{#x}</h1>\n")
+    test.assert(mdhtml.render_str("# a {x}\n", o) == "<h1 id=\"a-x\">a {x}</h1>\n")
+    test.assert(mdhtml.render_str("# a b}\n", o) == "<h1 id=\"a-b\">a b}</h1>\n")
+    test.assert(mdhtml.render_str("# {#only}\n", o) == "<h1 id=\"only\"></h1>\n")
+
+    test.case("a generated id reads emphasis, code, references and line breaks")
+    test.assert(mdhtml.render_str("Two *words* `c` &amp; x\nmore\n===\n", o)
+                == "<h1 id=\"two-words-c-x-more\">Two <em>words</em> <code>c</code> &amp; x\nmore</h1>\n")
+    test.assert(str.contains(mdhtml.render_str("# a <b>x</b>\n", o), "id=\"a-x\""))
+
+@test
+fn test_the_renderer_options_one_at_a_time() [io]
+    test.case("without the language class a fenced block has a bare code element")
+    var o = mdhtml.commonmark_options()
+    o.code_language_class = false
+    test.assert(mdhtml.render_str("```rust\nx\n```\n", o) == "<pre><code>x\n</code></pre>\n")
+
+    test.case("without xhtml a void element has no slash")
+    var h = mdhtml.commonmark_options()
+    h.xhtml = false
+    test.assert(mdhtml.render_str("a  \nb\n\n---\n", h) == "<p>a<br>\nb</p>\n<hr>\n")
+
+    test.case("a heading id prefix, and a repeat of the same heading")
+    var d = mdhtml.default_options()
+    d.heading_id_prefix = "p-"
+    test.assert(mdhtml.render_str("# A\n# A\n", d) == "<h1 id=\"p-a\">A</h1>\n<h1 id=\"p-a-1\">A</h1>\n")
+
+    test.case("an apostrophe is escaped in an attribute and in an href")
+    var out: [u8] = []
+    mdhtml.escape_attr(out, "a'b")
+    test.assert(bytes.byte_list_to_str(out) == "a&#39;b")
+    test.assert(cm("[x](/a'b)\n") == "<p><a href=\"/a&#x27;b\">x</a></p>\n")
+
+@test
+fn test_raw_html_everywhere_it_can_be() [io]
+    test.case("inline HTML inside emphasis, a heading and next to a code span")
+    test.assert(cm("*a <b>x</b>*\n") == "<p><em>a <b>x</b></em></p>\n")
+    test.assert(cm("# h <i>x</i>\n") == "<h1>h <i>x</i></h1>\n")
+    test.assert(cm("`a`<b>c</b>`d`\n") == "<p><code>a</code><b>c</b><code>d</code></p>\n")
+
+    test.case("inside an image's alt text, code and HTML are text")
+    test.assert(cm("![`c` <b>x</b>](/i.png)\n") == "<p><img src=\"/i.png\" alt=\"c &lt;b&gt;x&lt;/b&gt;\" /></p>\n")
+
+    test.case("tags and comments that are not complete are text")
+    test.assert(cm("<a =b> </ a> <?x <!-- y\n")
+                == "<p>&lt;a =b&gt; &lt;/ a&gt; &lt;?x &lt;!-- y</p>\n")
+    test.assert(cm("<a b='c\n") == "<p>&lt;a b='c</p>\n")
+
+    test.case("an HTML block at the end of a file with no newline")
+    test.assert(cm("<div>") == "<div>\n")
+
+@test
+fn test_links_that_are_not_links() [io]
+    test.case("a pointy destination may not hold another <")
+    test.assert(cm("[a](<b<c>)\n") == "<p>[a](&lt;b<c>)</p>\n")
+
+    test.case("parentheses nested more than 32 deep end the destination")
+    let deep = str.repeat("(", 33) + str.repeat(")", 33)
+    test.assert(str.starts_with(cm("[a](" + deep + ")\n"), "<p>[a]("))
+
+    test.case("a parenthesised title may hold no parenthesis, and an open title is none")
+    test.assert(cm("[a](/u (b(c)))\n") == "<p>[a](/u (b(c)))</p>\n")
+    test.assert(cm("[a](/u \"t\\\"x\")\n") == "<p><a href=\"/u\" title=\"t&quot;x\">a</a></p>\n")
+    test.assert(cm("[a](/u \"open\n") == "<p>[a](/u &quot;open</p>\n")
+
+    test.case("a label of 1000 characters is too long to be a label")
+    let long = str.repeat("x", 1000)
+    test.assert(str.starts_with(cm("[a][" + long + "]\n\n[" + long + "]: /u\n"), "<p>[a]["))
+
+    test.case("an email autolink whose domain label starts with a hyphen, or holds a space")
+    test.assert(cm("<a@-b.c>\n") == "<p>&lt;a@-b.c&gt;</p>\n")
+    test.assert(cm("<a@b c>\n") == "<p>&lt;a@b c&gt;</p>\n")
+    test.assert(cm("<a@b.>\n") == "<p>&lt;a@b.&gt;</p>\n")
+
+    test.case("an autolink's destination is taken as written, entities and backslashes alike")
+    test.assert(cm("<http://a&amp;b\\c>\n")
+                == "<p><a href=\"http://a&amp;amp;b%5Cc\">http://a&amp;amp;b\\c</a></p>\n")
+
+@test
+fn test_text_the_scanners_must_decode() [io]
+    test.case("a four-byte character before emphasis is not punctuation")
+    test.assert(cm("\u{1F600}*a*\n") == "<p>\u{1F600}<em>a</em></p>\n")
+
+    test.case("carriage-return line endings")
+    test.assert(cm("a\rb\r\n\r\nc") == "<p>a\nb</p>\n<p>c</p>\n")
+
+    test.case("a malformed byte next to a delimiter reads as a replacement character")
+    let bad = bytes.to_str(bytes.from_byte_list([0x80, 42, 97, 42, 0xE2, 97, 10]))
+    test.assert(str.contains(cm(bad), "<em>a</em>"))
+
+    test.case("a code block at the end of a file with no newline still ends its line")
+    test.assert(cm("    x") == "<pre><code>x\n</code></pre>\n")
+
+    test.case("a blank line inside a list item may hold a tab")
+    test.assert(cm("- a\n\t\n  b\n") == "<ul>\n<li>\n<p>a</p>\n<p>b</p>\n</li>\n</ul>\n")
+
+    test.case("an empty item in a nested list")
+    test.assert(cm("- a\n  - b\n  -\n- c\n")
+                == "<ul>\n<li>a\n<ul>\n<li>b</li>\n<li></li>\n</ul>\n</li>\n<li>c</li>\n</ul>\n")
+
+@test
+fn test_plain_text_and_the_tree_views() [io]
+    test.case("to_plain keeps characters, breaks, headings and cells")
+    test.assert(plain("# H\n\na&amp;b  \nc\nd\n\n| x |\n| - |\n") == "H\na&b\nc\nd\nx\n")
+
+    test.case("a tree's text, inner text and events for every kind of leaf")
+    let src = "# t\n\n![i](/p) a&amp;b  \nc\n\n<br>\n\n---\n\n- [ ] x\n\n    code\n\n-\n"
+    let doc = mdtree.build_with(src, mdparse.gfm_options())
+    test.assert(mdtree.text(doc, 999) == "")
+    test.assert(mdtree.find_first(doc, 0, is_image) > 0)
+    test.assert(list.len(mdtree.links(doc)) == 1)
+    let para = mdtree.children(doc, 0)[1]
+    test.assert(mdtree.inner_text(doc, para) == "i a&b c")
+    let replay = mdtree.events(doc)
+    let direct = mdparse.parser_with(src, mdparse.gfm_options()).events
+    test.assert(list.len(replay) == list.len(direct))
+    var same = true
+    for k in 0..list.len(direct)
+        if replay[k] != direct[k]
+            same = false
+    test.assert(same)
+    test.assert(list.len(mdtree.children(doc, 999)) == 0)
+
+    test.case("one node renders alone, and a node out of range renders nothing")
+    var out: [u8] = []
+    mdhtml.render_tree(out, doc, para, mdhtml.commonmark_options())
+    test.assert(bytes.byte_list_to_str(out)
+                == "<p><img src=\"/p\" alt=\"i\" /> a&amp;b<br />\nc</p>\n")
+    var none: [u8] = []
+    mdhtml.render_tree(none, doc, 999, mdhtml.commonmark_options())
+    test.assert(list.len(none) == 0)
+
+    test.case("the line of an offset in an empty document is 1")
+    test.assert(mdparse.line_of(mdparse.parser(""), 0) == 1)
+
+@test
+fn test_a_stream_a_caller_built_renders_as_written() [io]
+    let p = mdparse.parser("ab\n")
+    let r = MdRange { start: 0, end: 2 }
+
+    test.case("an image end with no start closes nothing")
+    let link = MdLink { destination: r, title: MdRange { start: 0, end: 0 },
+                        from_reference: false, prefix: "", autolink: false }
+    var out: [u8] = []
+    mdhtml.render_events(out, p, [MdText(r), MdEnd(TagImage(link))], mdhtml.commonmark_options())
+    test.assert(bytes.byte_list_to_str(out) == "ab")
+
+    test.case("a cell past the table's alignments has no align attribute")
+    var t: [u8] = []
+    mdhtml.render_events(t, p, [MdStart(TagTable([])), MdStart(TagTableRow), MdStart(TagTableCell),
+                                MdText(r), MdEnd(TagTableCell), MdEnd(TagTableRow),
+                                MdEnd(TagTable([]))],
+                                mdhtml.commonmark_options())
+    test.assert(bytes.byte_list_to_str(t)
+                == "<table>\n<tbody>\n<tr>\n<td>ab</td>\n</tr>\n</tbody>\n</table>\n")
+
+@test
+fn test_the_last_corners() [io]
+    test.case("a tab between two block quote markers")
+    test.assert(cm("> \t> x\n") == "<blockquote>\n<blockquote>\n<p>x</p>\n</blockquote>\n</blockquote>\n")
+
+    test.case("inline HTML in a table cell, strong emphasis, strikethrough and a link")
+    test.assert(str.contains(gfm("| <b>x</b> |\n| - |\n"), "<th><b>x</b></th>"))
+    test.assert(gfm("**<i>a</i>** ~~<i>b</i>~~ [<i>c</i>](/u)\n")
+                == "<p><strong><i>a</i></strong> <del><i>b</i></del> <a href=\"/u\"><i>c</i></a></p>\n")
+
+    test.case("an item that does not start with a bracket has no task marker")
+    test.assert(gfm("- plain\n") == "<ul>\n<li>plain</li>\n</ul>\n")
+
+    test.case("a setext heading's anchor may have spaces after it, and a } alone is text")
+    let o = mdhtml.default_options()
+    test.assert(mdhtml.render_str("Sub {#s}  \n---\n", o) == "<h2 id=\"s\">Sub</h2>\n")
+    test.assert(mdhtml.render_str("# ab}\n", o) == "<h1 id=\"ab\">ab}</h1>\n")
+
+    test.case("the tree's text and inner text of a leaf, of a soft break, and of nothing")
+    let doc = mdtree.build_with("a `c`\nb[^1]\n\n[^1]: n\n", mdparse.gfm_options())
+    test.assert(mdtree.text(doc, 1) == "a `c`\nb[^1]\n")
+    test.assert(mdtree.inner_text(doc, 1) == "a c b")
+    test.assert(mdtree.inner_text(doc, 999) == "")
+    test.assert(mdtree.inner_text(doc, 2) == "")
+
+    test.case("a leaf renders alone, and the replay carries code, breaks and references")
+    var leaf: [u8] = []
+    mdhtml.render_tree(leaf, doc, 2, mdhtml.commonmark_options())
+    test.assert(bytes.byte_list_to_str(leaf) == "a ")
+    let replay = mdtree.events(doc)
+    let direct = mdparse.parser_with("a `c`\nb[^1]\n\n[^1]: n\n", mdparse.gfm_options()).events
+    test.assert(list.len(replay) == list.len(direct))
+    var same = true
+    for k in 0..list.len(direct)
+        if replay[k] != direct[k]
+            same = false
+    test.assert(same)

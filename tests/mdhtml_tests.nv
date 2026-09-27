@@ -1,24 +1,18 @@
-// mdhtml_tests.nv — the API suite for the HTML renderer.
+// mdhtml_tests.nv — the HTML renderer.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: markdown-nv.mdhtml.<fn>`.
+// Each case is an example from the CommonMark specification (0.31.2)
+// or the GFM specification, input and output, named by its section.
+// They run under `commonmark_options()`, the configuration in which the
+// renderer agrees with the specification exactly; `spec_tests.nv` holds
+// every example, and these are the ones that show what a rule is for.
 //
-// THE CASES ARE THE COMMONMARK SPEC's OWN.  Each one below is an
-// example from the spec (0.31.2) or from the GitHub Flavored Markdown
-// spec, quoted as input-and-output and named by the section it is in,
-// and every one of them is run under `commonmark_options()` — the
-// configuration in which this renderer is supposed to agree with the
-// spec exactly.  The whole appendix — 652 examples — becomes a
-// generated suite beside this one when the implementation lands;
-// these are the ones that explain what the rules are for.
-//
-// THE LAST TWO TESTS ARE NOT FROM THE SPEC and are the ones that
-// matter most: they check the two places this renderer deliberately
-// DISAGREES with CommonMark, because CommonMark's answer is the unsafe
-// one when the document came from somebody else.
+// The last tests check the two places the default options differ from
+// CommonMark: raw HTML is escaped, and a link destination must pass a
+// rule, because the usual input is a document somebody else wrote.
 
 use std.test
 use std.list
+use std.bytes
 use mdparse
 use mdtree
 use mdhtml
@@ -71,10 +65,10 @@ fn test_the_emphasis_rules_are_about_flanking_not_about_pairs() [io]
     test.assert(mdhtml.render_str("a * foo bar*\n", o) == "<p>a * foo bar*</p>\n")
     test.assert(mdhtml.render_str("** foo bar**\n", o) == "<p>** foo bar**</p>\n")
 
-    test.case("but an asterisk inside a word IS — `5*6*78`")
+    test.case("but an asterisk inside a word is — `5*6*78`")
     test.assert(mdhtml.render_str("5*6*78\n", o) == "<p>5<em>6</em>78</p>\n")
 
-    test.case("and an underscore inside a word is NOT — that is the whole difference")
+    test.case("and an underscore inside a word is not — that is the whole difference")
     test.assert(mdhtml.render_str("foo_bar_baz\n", o) == "<p>foo_bar_baz</p>\n")
     test.assert(mdhtml.render_str("_foo bar_\n", o) == "<p><em>foo bar</em></p>\n")
 
@@ -174,8 +168,10 @@ fn test_breaks_blockquotes_and_lists() [io]
 
 @test
 fn test_gfm_tables_are_the_extension_the_plan_asked_for() [io]
-    // From the GitHub Flavored Markdown spec, § Tables (extension).
-    var o = mdhtml.commonmark_options()
+    // From the GitHub Flavored Markdown spec, section 4.10.  Tables are
+    // an extension, on under the default options and off under strict
+    // CommonMark.
+    let o = mdhtml.default_options()
 
     test.case("a header row, a delimiter row, and a body row")
     let simple = "| foo | bar |\n| --- | --- |\n| baz | bim |\n"
@@ -193,7 +189,7 @@ fn test_gfm_tables_are_the_extension_the_plan_asked_for() [io]
 
 @test
 fn test_raw_html_is_escaped_by_default_and_that_is_not_commonmark() [io]
-    // THE FIRST DELIBERATE DISAGREEMENT.  CommonMark says to pass raw
+    // The first difference from CommonMark, which says to pass raw
     // HTML through.  A renderer whose input is a README somebody
     // published is a renderer whose input is hostile, and passing
     // `<script>` through is that document running code on the reader's
@@ -219,9 +215,9 @@ fn test_raw_html_is_escaped_by_default_and_that_is_not_commonmark() [io]
 
 @test
 fn test_the_url_rule_is_a_value_and_the_default_is_the_registry_s() [io]
-    // THE SECOND DELIBERATE DISAGREEMENT, and the dogfood: this is the
-    // novo-lang registry's own `safe_href`, which is twenty lines in
-    // `orbit/website/src/packages.nv` today.
+    // The second difference from CommonMark: a link destination passes
+    // a rule, and the default admits only what a published page may
+    // link to.
     let safe = mdhtml.default_options()
     let spec = mdhtml.commonmark_options()
 
@@ -272,20 +268,22 @@ fn test_heading_ids_are_generated_and_never_collide() [io]
 
 @test
 fn test_the_renderer_appends_rather_than_allocating() [io]
-    // The whole of why this package is `core`: a site build renders 58
-    // pages into one buffer and writes once.
+    // A caller rendering many pages renders them into one buffer and
+    // writes once.
     let o = mdhtml.default_options()
 
     test.case("the buffer comes back with the page appended")
-    let one = mdhtml.render([], "a\n", o)
+    var one = mdhtml.render([], "a\n", o)
     test.assert(list.len(one) > 0)
 
     test.case("and a second page appends to the first rather than replacing it")
+    let before = list.len(one)
     let two = mdhtml.render(one, "b\n", o)
-    test.assert(list.len(two) > list.len(one))
+    test.assert(list.len(two) > before)
+    test.assert(bytes.byte_list_to_str(two) == "<p>a</p>\n<p>b</p>\n")
 
     test.case("escaping is public, so a caller's own text uses the same one")
-    test.assert(list.len(mdhtml.escape_text([], "a<b")) == 7)
+    test.assert(list.len(mdhtml.escape_text([], "a<b")) == 6)
     test.assert(list.len(mdhtml.escape_attr([], "a\"b")) == 8)
 
 @test
@@ -346,8 +344,8 @@ fn test_the_other_three_renderers_are_the_same_renderer() [io]
 
 @test
 fn test_a_link_checker_reads_the_definitions_rather_than_the_output() [io]
-    // The site generator searches rendered HTML for `href="` today,
-    // which finds the href in a code sample too.
+    // Searching rendered HTML for `href="` would find the one in a code
+    // sample too; the definitions are the answer to the question.
     let p = mdparse.parser("[a][x]\n\n[x]: /url\n")
 
     test.case("the definitions are available before the walk finishes")
@@ -361,4 +359,14 @@ fn test_the_tree_can_be_built_with_options_and_counted() [io]
 
     test.case("and the default makes it a table, so the trees differ")
     let tables = mdtree.build_with("| a |\n| - |\n", mdparse.default_options())
-    test.assert(mdtree.count(tables) != mdtree.count(strict))
+    test.assert(first_is_table(tables))
+    test.assert(not first_is_table(strict))
+
+fn first_is_table(doc: mdtree.MdDoc) -> Bool
+    match mdtree.node(doc, 1)
+        Some(n) =>
+            match n.kind
+                NodeContainer(TagTable(_)) => true
+                _                          => false
+        None    =>
+            false

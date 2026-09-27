@@ -1,14 +1,11 @@
-// mdparse_tests.nv — the API suite for the pull parser.
+// mdparse_tests.nv — the pull parser.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`.
-//
-// WHERE mdhtml_tests.nv CHECKS WHAT THE SPEC SAYS THE OUTPUT IS, this
-// suite checks the things a pull parser promises that a renderer
-// cannot show: that an event's range points into the caller's source
-// and not at a copy, that the two text events cover the cases a range
-// alone cannot, that every `MdStart` has a matching `MdEnd` even when
-// the document did not close what it opened, and that a document
-// cannot make a `core` parser exceed its bounds.
+// This suite checks what the event stream promises and a rendering
+// cannot show: that an event's range points into the caller's source,
+// that the two text events cover what a range alone cannot, that every
+// `MdStart` has its `MdEnd` even when the document did not close what
+// it opened, and that a document cannot take the parser past its
+// bounds.
 
 use std.test
 use std.list
@@ -199,12 +196,12 @@ fn test_the_three_unicode_questions_are_published_because_the_spec_asks_them() [
     test.assert(mdparse.is_unicode_whitespace(0x00A0))
     test.assert(mdparse.is_unicode_whitespace(0x0061) == false)
 
-    test.case("its Unicode punctuation is the P categories AND the S categories")
+    test.case("its Unicode punctuation is the P categories and the S categories")
     test.assert(mdparse.is_unicode_punctuation(0x002E))
     test.assert(mdparse.is_unicode_punctuation(0x002B))
     test.assert(mdparse.is_unicode_punctuation(0x0061) == false)
 
-    test.case("and a reference label's key is case-FOLDED, not lowercased")
+    test.case("and a reference label's key is case-folded, not lowercased")
     let p = mdparse.parser("[stra\u{00DF}e]: /url\n")
     test.assert(mdparse.reference_label_key(p, MdRange { start: 1, end: 8 })
                 == "strasse")

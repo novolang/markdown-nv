@@ -1,12 +1,8 @@
-// mdtree_tests.nv — the API suite for the tree.
+// mdtree_tests.nv — the tree.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`.
-//
-// WHAT A TREE IS FOR is the whole subject here: a renderer does not
-// need one, and every test below is a question that cannot be answered
-// while walking the event stream forwards — a node's siblings, its
-// parent, the document's headings in order, and whether the tree and
-// the events agree.
+// Every test asks something that cannot be answered while walking the
+// events forwards: a node's siblings, its parent, the document's
+// headings in order, and whether the tree and the events agree.
 
 use std.test
 use std.list
