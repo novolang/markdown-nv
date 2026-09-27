@@ -735,16 +735,15 @@ fn list_tight(st: Blocks, id: Int) -> Bool
 // ── Link reference definitions (section 4.7) ──────────────────────────
 
 // The text of leaf `id`'s lines, joined.
+//
+// The definitions are taken once per paragraph, before anything has
+// been cut from its first line, so every line is read whole.
 fn leaf_segs(st: Blocks, id: Int) -> mdscan.Segs
     var starts: [Int] = []
     var ends: [Int] = []
     var joins: [Int] = []
     for k in st.l0[id]..st.l1[id]
-        let s = if k == st.l0[id] and st.cut[id] >= 0
-            st.cut[id]
-        else
-            st.ln_start[k]
-        list.push(starts, s)
+        list.push(starts, st.ln_start[k])
         list.push(ends, st.ln_end[k])
         list.push(joins, (if st.ln_join[k] > 0 then st.ln_join[k] else 1))
     mdscan.segs(st.source, starts, ends, joins)
@@ -895,11 +894,10 @@ fn table_start(var st: Blocks, para: Int, ln: Line) -> Int
     var aligns = delimiter_row(ln.s, ln.fns, ln.end)
     if list.len(aligns) == 0
         return -1
+    // The paragraph's definitions are taken when it closes, after this,
+    // so its last line is still whole.
     let h = n - 1
-    let hs = if h == st.l0[para] and st.cut[para] >= 0
-        st.cut[para]
-    else
-        st.ln_start[h]
+    let hs = st.ln_start[h]
     let header = row_cells(st.source, hs, st.ln_end[h])
     if list.len(header) != list.len(aligns)
         return -1

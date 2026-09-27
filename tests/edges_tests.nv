@@ -256,6 +256,12 @@ fn test_raw_html_everywhere_it_can_be() [io]
     test.assert(cm("# h <i>x</i>\n") == "<h1>h <i>x</i></h1>\n")
     test.assert(cm("`a`<b>c</b>`d`\n") == "<p><code>a</code><b>c</b><code>d</code></p>\n")
 
+    test.case("inside an image's alt text, line breaks are spaces")
+    test.assert(cm("![a\nb  \nc](/i)\n") == "<p><img src=\"/i\" alt=\"a b c\" /></p>\n")
+
+    test.case("an attribute whose unquoted value is empty is not a tag")
+    test.assert(cm("<a b=>\n") == "<p>&lt;a b=&gt;</p>\n")
+
     test.case("inside an image's alt text, code and HTML are text")
     test.assert(cm("![`c` <b>x</b>](/i.png)\n") == "<p><img src=\"/i.png\" alt=\"c &lt;b&gt;x&lt;/b&gt;\" /></p>\n")
 

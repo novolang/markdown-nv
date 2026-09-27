@@ -685,10 +685,7 @@ fn emit_table(var em: Emitter, id: Int)
     push(em, MdStart(tag), a, e)
     for ln in st.l0[id]..st.l1[id]
         let head = ln == st.l0[id]
-        let ls = if head and st.start[id] > st.ln_start[ln]
-            st.start[id]
-        else
-            st.ln_start[ln]
+        let ls = st.ln_start[ln]
         let row_tag = if head
             TagTableHead
         else
