@@ -1,0 +1,846 @@
+// mdscan.nv — the character classes and the small recognisers the
+// block and inline parsers are built from.
+//
+// Every function here reads a string at a byte position and answers a
+// position or a verdict; none of them builds a document.  Where a
+// function takes an `end`, it reads nothing at or after it, so a block
+// parser can hand it one line of a larger source.  A position past the
+// end reads as -1, which no class admits.
+//
+// The rules are CommonMark 0.31.2's, cited by section.
+
+use std.str
+use std.list
+use uclass
+use ucase
+use udata
+use mdentity
+
+// The byte at `i`, or -1 outside `[0, end)`.
+fn at(s: Str, i: Int, end: Int) -> Int
+    if i < 0 or i >= end
+        return -1
+    str.byte_at_or(s, i, -1)
+
+fn is_space_or_tab(b: Int) -> Bool
+    b == ' ' or b == '\t'
+
+// A line ending, or the end of the text.
+fn is_line_end(b: Int) -> Bool
+    b == '\n' or b == '\r' or b < 0
+
+// CommonMark's whitespace for the purpose of the scanners: space, tab,
+// line feed, line tabulation, form feed and carriage return.
+fn is_ascii_space(b: Int) -> Bool
+    b == ' ' or b == '\t' or b == '\n' or b == 11 or b == 12 or b == '\r'
+
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+fn is_hex(b: Int) -> Bool
+    is_digit(b) or b >= 'a' and b <= 'f' or b >= 'A' and b <= 'F'
+
+fn is_alpha(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z'
+
+fn is_alnum(b: Int) -> Bool
+    is_alpha(b) or is_digit(b)
+
+// An ASCII punctuation character (section 2.1): the characters that a
+// backslash can escape.
+fn is_ascii_punct(b: Int) -> Bool
+    b >= '!' and b <= '/' or b >= ':' and b <= '@' or b >= '[' and b <= '`'
+        or b >= '{' and b <= '~'
+
+fn lower_ascii(b: Int) -> Int
+    if b >= 'A' and b <= 'Z'
+        b + 32
+    else
+        b
+
+// The codepoint starting at byte `i`, and how many bytes it takes.  A
+// malformed sequence reads as U+FFFD, one byte long.
+fn decode(s: Str, i: Int, end: Int) -> (Int, Int)
+    let b0 = at(s, i, end)
+    if b0 < 0x80
+        return (b0, 1)
+    var n = 0
+    var cp = 0
+    if b0 >= 0xF0 and b0 < 0xF8
+        n = 4
+        cp = b0 - 0xF0
+    elif b0 >= 0xE0
+        n = 3
+        cp = b0 - 0xE0
+    elif b0 >= 0xC0
+        n = 2
+        cp = b0 - 0xC0
+    else
+        return (0xFFFD, 1)
+    for k in 1..n
+        let b = at(s, i + k, end)
+        if b < 0x80 or b >= 0xC0
+            return (0xFFFD, 1)
+        cp = cp * 64 + (b - 0x80)
+    (cp, n)
+
+// The codepoint that ends just before byte `i`, or a line feed at the
+// start of the text, which counts as whitespace in the flanking rules.
+fn decode_before(s: Str, i: Int) -> Int
+    if i <= 0
+        return '\n'
+    var k = i - 1
+    for _ in 0..3
+        let b = str.byte_at_or(s, k, 0)
+        if b < 0x80 or b >= 0xC0 or k == 0
+            break
+        k = k - 1
+    decode(s, k, i).0
+
+// A Unicode whitespace character (section 2.1): the Zs category, or a
+// tab, line feed, form feed or carriage return.
+fn unicode_whitespace(cp: Int) -> Bool
+    if cp < 0x80
+        return cp == ' ' or cp == '\t' or cp == '\n' or cp == 12 or cp == '\r'
+    cp != 0x85 and cp != 0x2028 and cp != 0x2029 and uclass.is_whitespace(cp)
+
+// A Unicode punctuation character (section 2.1): the P and the S
+// categories.
+fn unicode_punctuation(cp: Int) -> Bool
+    if cp < 0x80
+        return is_ascii_punct(cp)
+    uclass.is_punctuation(cp) or uclass.is_symbol(cp)
+
+// The label a reference definition is matched by (section 4.7): the
+// text with leading and trailing whitespace taken off, every inner run
+// of whitespace made one space, and Unicode case folding applied.
+fn label_key(text: Str) -> Str
+    var parts: [Str] = []
+    var pending = false
+    let n = str.len(text)
+    var i = 0
+    for _ in 0..n
+        if i >= n
+            break
+        let b = str.byte_at_or(text, i, 0)
+        if is_ascii_space(b)
+            pending = list.len(parts) > 0
+            i = i + 1
+            continue
+        if pending
+            list.push(parts, " ")
+            pending = false
+        var j = i
+        for _ in i..n
+            if j >= n or is_ascii_space(str.byte_at_or(text, j, 0))
+                break
+            j = j + 1
+        list.push(parts, str.slice(text, i, j))
+        i = j
+    ucase.fold(udata.data_full(), str.join(parts, ""))
+
+// ── Lines ─────────────────────────────────────────────────────────────
+
+// Every line of `s` as `(start, end, next)`: `end` is before the line
+// ending and `next` after it.  A line ending is a line feed, a carriage
+// return, or the two together (section 2.2).
+fn line_table(s: Str) -> [(Int, Int, Int)]
+    var out: [(Int, Int, Int)] = []
+    let n = str.len(s)
+    var start = 0
+    var i = 0
+    for _ in 0..n + 1
+        if i >= n
+            break
+        let b = str.byte_at_or(s, i, 0)
+        if b == '\n'
+            list.push(out, (start, i, i + 1))
+            i = i + 1
+            start = i
+        elif b == '\r'
+            let next = if str.byte_at_or(s, i + 1, 0) == '\n'
+                i + 2
+            else
+                i + 1
+            list.push(out, (start, i, next))
+            i = next
+            start = i
+        else
+            i = i + 1
+    if start < n
+        list.push(out, (start, n, n))
+    out
+
+// Whether `[i, end)` is only spaces and tabs.
+fn blank_from(s: Str, i: Int, end: Int) -> Bool
+    for k in i..end
+        if not is_space_or_tab(str.byte_at_or(s, k, 0))
+            return false
+    true
+
+// ── Leaf block starts (section 4) ─────────────────────────────────────
+
+// A thematic break at `i` (section 4.1): three or more of one of `*`,
+// `-` or `_`, with only spaces and tabs between them and after them.
+fn thematic_break(s: Str, i: Int, end: Int) -> Bool
+    let c = at(s, i, end)
+    if c != '*' and c != '-' and c != '_'
+        return false
+    var count = 0
+    for k in i..end
+        let b = str.byte_at_or(s, k, 0)
+        if b == c
+            count = count + 1
+        elif not is_space_or_tab(b)
+            return false
+    count >= 3
+
+// The level of an ATX heading opening at `i` (section 4.2), or 0.
+fn atx_level(s: Str, i: Int, end: Int) -> Int
+    var n = 0
+    for k in 0..7
+        if at(s, i + k, end) != '#'
+            break
+        n = n + 1
+    if n == 0 or n > 6
+        return 0
+    let after = at(s, i + n, end)
+    if after < 0 or is_space_or_tab(after)
+        return n
+    0
+
+// The content of an ATX heading line whose `#`s start at `i`: the
+// range after the opening sequence, with the closing sequence and the
+// surrounding spaces taken off.
+fn atx_content(s: Str, i: Int, end: Int, level: Int) -> (Int, Int)
+    var a = i + level
+    for _ in a..end
+        if not is_space_or_tab(at(s, a, end))
+            break
+        a = a + 1
+    var e = end
+    for _ in a..end
+        if not is_space_or_tab(at(s, e - 1, end))
+            break
+        e = e - 1
+    var h = e
+    for _ in a..e
+        if at(s, h - 1, end) != '#'
+            break
+        h = h - 1
+    if h < e and (h == a or is_space_or_tab(at(s, h - 1, end)))
+        e = h
+        for _ in a..e
+            if not is_space_or_tab(at(s, e - 1, end))
+                break
+            e = e - 1
+    (a, e)
+
+// The level of a setext underline at `i` (section 4.3): 1 for `=`, 2
+// for `-`, or 0.
+fn setext_level(s: Str, i: Int, end: Int) -> Int
+    let c = at(s, i, end)
+    if c != '=' and c != '-'
+        return 0
+    var k = i
+    for _ in i..end
+        if at(s, k, end) != c
+            break
+        k = k + 1
+    if not blank_from(s, k, end)
+        return 0
+    if c == '='
+        1
+    else
+        2
+
+// An opening code fence at `i` (section 4.5), as `(fence character,
+// length)`, or a length of 0.  A backtick fence's info string may not
+// contain a backtick.
+fn fence_open(s: Str, i: Int, end: Int) -> (Int, Int)
+    let c = at(s, i, end)
+    if c != '`' and c != '~'
+        return (0, 0)
+    var n = 0
+    for k in i..end
+        if str.byte_at_or(s, k, 0) != c
+            break
+        n = n + 1
+    if n < 3
+        return (0, 0)
+    if c == '`'
+        for k in i + n..end
+            if str.byte_at_or(s, k, 0) == '`'
+                return (0, 0)
+    (c, n)
+
+// Whether the line at `i` closes a fence of `c` repeated at least `n`
+// times.
+fn fence_close(s: Str, i: Int, end: Int, c: Int, n: Int) -> Bool
+    var k = i
+    for _ in i..end
+        if at(s, k, end) != c
+            break
+        k = k + 1
+    k - i >= n and blank_from(s, k, end)
+
+// ── HTML blocks (section 4.6) ─────────────────────────────────────────
+
+fn block_tag_names() -> [Str]
+    ["address", "article", "aside", "base", "basefont", "blockquote", "body", "caption",
+     "center", "col", "colgroup", "dd", "details", "dialog", "dir", "div", "dl", "dt",
+     "fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset", "h1", "h2",
+     "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "iframe", "legend", "li", "link",
+     "main", "menu", "menuitem", "nav", "noframes", "ol", "optgroup", "option", "p", "param",
+     "search", "section", "summary", "table", "tbody", "td", "tfoot", "th", "thead", "title",
+     "tr", "track", "ul"]
+
+// Whether `s` at `i` holds `word`, compared without ASCII case.
+fn starts_ci(s: Str, i: Int, end: Int, word: Str) -> Bool
+    let n = str.len(word)
+    if i + n > end
+        return false
+    for k in 0..n
+        if lower_ascii(at(s, i + k, end)) != str.byte_at_or(word, k, 0)
+            return false
+    true
+
+// The ASCII letters and digits of a tag name at `i`, lowercased, and
+// where they end.
+fn tag_name_at(s: Str, i: Int, end: Int) -> (Str, Int)
+    var k = i
+    var parts: [Str] = []
+    for _ in i..end
+        let b = at(s, k, end)
+        if not is_alnum(b)
+            break
+        list.push(parts, str.from_byte(lower_ascii(b)))
+        k = k + 1
+    (str.join(parts, ""), k)
+
+// The kind of HTML block that starts at `i`, 1 to 7, or 0.  Kind 7 is
+// answered only when `allow7`, since it cannot interrupt a paragraph.
+fn html_block_start(s: Str, i: Int, end: Int, allow7: Bool) -> Int
+    if at(s, i, end) != '<'
+        return 0
+    let j = i + 1
+    for w in ["script", "pre", "style", "textarea"]
+        if starts_ci(s, j, end, w)
+            let after = at(s, j + str.len(w), end)
+            if after < 0 or is_space_or_tab(after) or after == '>'
+                return 1
+    if starts_ci(s, j, end, "!--")
+        return 2
+    if at(s, j, end) == '?'
+        return 3
+    if at(s, j, end) == '!' and is_alpha(at(s, j + 1, end))
+        return 4
+    if starts_ci(s, j, end, "![cdata[")
+        return 5
+    let name_at = if at(s, j, end) == '/'
+        j + 1
+    else
+        j
+    let name = tag_name_at(s, name_at, end)
+    if name.0 != "" and list.contains(block_tag_names(), name.0)
+        let after = at(s, name.1, end)
+        if after < 0 or is_space_or_tab(after) or after == '>'
+                or after == '/' and at(s, name.1 + 1, end) == '>'
+            return 6
+    if allow7
+        let close = if at(s, j, end) == '/'
+            closing_tag(s, i, end)
+        else
+            open_tag(s, i, end)
+        if close > 0 and blank_from(s, close, end)
+            let tn = tag_name_at(s, name_at, end).0
+            if tn != "script" and tn != "style" and tn != "pre" and tn != "textarea"
+                return 7
+    0
+
+// Whether the line `[i, end)` ends an HTML block of `kind` 1 to 5.
+fn html_block_ends(s: Str, i: Int, end: Int, kind: Int) -> Bool
+    let line = str.lower(str.slice(s, i, end))
+    if kind == 1
+        return str.contains(line, "</script>") or str.contains(line, "</pre>")
+               or str.contains(line, "</style>") or str.contains(line, "</textarea>")
+    if kind == 2
+        return str.contains(line, "-->")
+    if kind == 3
+        return str.contains(line, "?>")
+    if kind == 4
+        return str.contains(line, ">")
+    str.contains(line, "]]>")
+
+// ── Raw HTML (section 6.6) ────────────────────────────────────────────
+
+// Whitespace inside a tag: spaces, tabs and line endings.  The text of
+// a block holds no blank line, so this never crosses more than one
+// line ending, which is the limit sections 6.3 and 6.6 set.
+fn skip_tag_space(s: Str, i: Int, end: Int) -> Int
+    var k = i
+    for _ in i..end
+        let b = at(s, k, end)
+        if not (b == '\n' or b == ' ' or b == '\t' or b == '\r')
+            break
+        k = k + 1
+    k
+
+// The end of an open tag at `i`, or -1.
+fn open_tag(s: Str, i: Int, end: Int) -> Int
+    if at(s, i, end) != '<' or not is_alpha(at(s, i + 1, end))
+        return -1
+    var k = i + 2
+    for _ in k..end
+        let b = at(s, k, end)
+        if not (is_alnum(b) or b == '-')
+            break
+        k = k + 1
+    var result = -1
+    for _ in 0..end
+        let sp = skip_tag_space(s, k, end)
+        let b = at(s, sp, end)
+        if b == '>'
+            result = sp + 1
+            break
+        if b == '/' and at(s, sp + 1, end) == '>'
+            result = sp + 2
+            break
+        let attr = if sp == k
+            -1
+        else
+            attribute(s, sp, end)
+        if attr < 0
+            break
+        k = attr
+    result
+
+// The end of one attribute at `i`, or -1.
+fn attribute(s: Str, i: Int, end: Int) -> Int
+    let b0 = at(s, i, end)
+    if not (is_alpha(b0) or b0 == '_' or b0 == ':')
+        return -1
+    var k = i + 1
+    for _ in k..end
+        let b = at(s, k, end)
+        if not (is_alnum(b) or b == '_' or b == '.' or b == ':' or b == '-')
+            break
+        k = k + 1
+    let sp = skip_tag_space(s, k, end)
+    if at(s, sp, end) != '='
+        return k
+    let v = skip_tag_space(s, sp + 1, end)
+    let q = at(s, v, end)
+    if q == '"' or q == '\''
+        for e in v + 1..end
+            if str.byte_at_or(s, e, 0) == q
+                return e + 1
+        return -1
+    var e = v
+    for _ in v..end
+        let b = at(s, e, end)
+        if b < 0 or is_ascii_space(b) or b == '"' or b == '\'' or b == '=' or b == '<'
+                or b == '>' or b == '`'
+            break
+        e = e + 1
+    if e == v
+        -1
+    else
+        e
+
+// The end of a closing tag at `i`, or -1.
+fn closing_tag(s: Str, i: Int, end: Int) -> Int
+    if at(s, i, end) != '<' or at(s, i + 1, end) != '/' or not is_alpha(at(s, i + 2, end))
+        return -1
+    var k = i + 3
+    for _ in k..end
+        let b = at(s, k, end)
+        if not (is_alnum(b) or b == '-')
+            break
+        k = k + 1
+    let sp = skip_tag_space(s, k, end)
+    if at(s, sp, end) == '>'
+        sp + 1
+    else
+        -1
+
+// The end of any raw HTML at `i` (section 6.6), or -1.
+fn raw_html(s: Str, i: Int, end: Int) -> Int
+    let b1 = at(s, i + 1, end)
+    if is_alpha(b1)
+        return open_tag(s, i, end)
+    if b1 == '/'
+        return closing_tag(s, i, end)
+    if b1 == '?'
+        return find_from(s, i + 2, end, "?>")
+    if b1 == '!'
+        if starts_ci(s, i + 2, end, "--")
+            if at(s, i + 4, end) == '>'
+                return i + 5
+            if at(s, i + 4, end) == '-' and at(s, i + 5, end) == '>'
+                return i + 6
+            return find_from(s, i + 4, end, "-->")
+        if starts_ci(s, i + 2, end, "[cdata[")
+            return find_from(s, i + 9, end, "]]>")
+        if is_alpha(at(s, i + 2, end))
+            return find_from(s, i + 2, end, ">")
+    -1
+
+// The position after the first `pat` at or after `i`, or -1.  What
+// lies past `end` in a block's text is whitespace, so a match never
+// ends past it.
+fn find_from(s: Str, i: Int, end: Int, pat: Str) -> Int
+    match str.index_from(s, pat, i)
+        Some(k) => k + str.len(pat)
+        None    => -1
+
+// ── Autolinks (section 6.5) ───────────────────────────────────────────
+
+// An autolink at `i`, as `(end, is_email)`, or an end of -1.
+fn autolink(s: Str, i: Int, end: Int) -> (Int, Bool)
+    if not is_alpha(at(s, i + 1, end))
+        return email_autolink(s, i, end)
+    var k = i + 2
+    for _ in k..end
+        let b = at(s, k, end)
+        if not (is_alnum(b) or b == '+' or b == '.' or b == '-')
+            break
+        k = k + 1
+    let scheme = k - (i + 1)
+    if at(s, k, end) != ':' or scheme < 2 or scheme > 32
+        return email_autolink(s, i, end)
+    k = k + 1
+    for _ in k..end
+        let b = at(s, k, end)
+        if b == '>'
+            return (k + 1, false)
+        if b < 0 or b <= ' ' or b == '<'
+            break
+        k = k + 1
+    email_autolink(s, i, end)
+
+fn email_autolink(s: Str, i: Int, end: Int) -> (Int, Bool)
+    var k = i + 1
+    for _ in k..end
+        let b = at(s, k, end)
+        if not (is_alnum(b) or b > ' ' and b < 127 and str.contains(".!#$%&'*+/=?^_`{|}~-", str.from_byte(b)))
+            break
+        k = k + 1
+    if k == i + 1 or at(s, k, end) != '@'
+        return (-1, false)
+    k = k + 1
+    var result = (-1, false)
+    for _ in 0..end
+        let start = k
+        for _ in 0..63
+            let b = at(s, k, end)
+            if not (is_alnum(b) or b == '-')
+                break
+            k = k + 1
+        if k == start or at(s, start, end) == '-' or at(s, k - 1, end) == '-'
+            break
+        if at(s, k, end) == '>'
+            result = (k + 1, true)
+            break
+        if at(s, k, end) != '.'
+            break
+        k = k + 1
+    result
+
+// ── Link parts (section 6.3) ──────────────────────────────────────────
+
+// A link label at `i` (the `[`), as the position after its `]`, or -1.
+// At most 999 characters, no unescaped bracket, and not blank.
+fn link_label(s: Str, i: Int, end: Int) -> Int
+    if at(s, i, end) != '['
+        return -1
+    var k = i + 1
+    var nonblank = false
+    for _ in 0..1000
+        let b = at(s, k, end)
+        if b < 0 or b == '['
+            return -1
+        if b == ']'
+            if not nonblank or k - i - 1 > 999
+                return -1
+            return k + 1
+        if b == '\\' and is_ascii_punct(at(s, k + 1, end))
+            k = k + 2
+            nonblank = true
+            continue
+        if not is_ascii_space(b)
+            nonblank = true
+        k = k + 1
+    -1
+
+// Spaces, tabs and at most one line ending.
+fn skip_spnl(s: Str, i: Int, end: Int) -> Int
+    skip_tag_space(s, i, end)
+
+// A link destination at `i` (section 6.3), as `(start, end, next)`
+// with the angle brackets outside the range, or a `next` of -1.
+fn link_destination(s: Str, i: Int, end: Int) -> (Int, Int, Int)
+    if at(s, i, end) == '<'
+        var k = i + 1
+        var found = (0, 0, -1)
+        for _ in k..end + 1
+            let b = at(s, k, end)
+            if b == '>'
+                found = (i + 1, k, k + 1)
+                break
+            if b < 0 or b == '\n' or b == '\r' or b == '<'
+                break
+            if b == '\\' and is_ascii_punct(at(s, k + 1, end))
+                k = k + 1
+            k = k + 1
+        return found
+    var k = i
+    var depth = 0
+    for _ in i..end
+        let b = at(s, k, end)
+        if b < 0 or b <= ' ' or b == 127
+            break
+        if b == '\\' and is_ascii_punct(at(s, k + 1, end))
+            k = k + 2
+            continue
+        if b == '('
+            depth = depth + 1
+            if depth > 32
+                return (0, 0, -1)
+        elif b == ')'
+            if depth == 0
+                break
+            depth = depth - 1
+        k = k + 1
+    if k == i or depth != 0
+        return (0, 0, -1)
+    (i, k, k)
+
+// A link title at `i` (section 6.3), as `(start, end, next)` with the
+// quotes outside the range, or a `next` of -1.
+fn link_title(s: Str, i: Int, end: Int) -> (Int, Int, Int)
+    let open = at(s, i, end)
+    if open != '"' and open != '\'' and open != '('
+        return (0, 0, -1)
+    let close = if open == '('
+        ')'
+    else
+        open
+    var k = i + 1
+    for _ in k..end
+        let b = at(s, k, end)
+        if b == '\\' and is_ascii_punct(at(s, k + 1, end))
+            k = k + 2
+            continue
+        if b == close
+            return (i + 1, k, k + 1)
+        if open == '(' and b == '('
+            break
+        k = k + 1
+    (0, 0, -1)
+
+// ── Entities (section 2.5) ────────────────────────────────────────────
+
+// An entity or numeric character reference at `i` (the `&`), as its
+// codepoints and the position after its `;`, or an empty list.  A
+// numeric reference to zero, to a surrogate or past U+10FFFF is
+// U+FFFD.
+fn entity(s: Str, i: Int, end: Int) -> ([Int], Int)
+    var none: [Int] = []
+    if at(s, i + 1, end) == '#'
+        var k = i + 2
+        var hex = false
+        if at(s, k, end) == 'x' or at(s, k, end) == 'X'
+            hex = true
+            k = k + 1
+        let start = k
+        var v = 0
+        for _ in 0..8
+            let b = at(s, k, end)
+            if hex and is_hex(b)
+                v = v * 16 + hex_value(b)
+            elif not hex and is_digit(b)
+                v = v * 10 + (b - '0')
+            else
+                break
+            k = k + 1
+        let digits = k - start
+        if digits == 0 or hex and digits > 6 or not hex and digits > 7 or at(s, k, end) != ';'
+            return (none, i)
+        if v == 0 or v >= 0xD800 and v <= 0xDFFF or v > 0x10FFFF
+            v = 0xFFFD
+        return ([v], k + 1)
+    var k = i + 1
+    for _ in 0..32
+        if not is_alnum(at(s, k, end))
+            break
+        k = k + 1
+    if k == i + 1 or at(s, k, end) != ';'
+        return (none, i)
+    let cps = mdentity.lookup(str.slice(s, i + 1, k))
+    if list.len(cps) == 0
+        return (none, i)
+    (cps, k + 1)
+
+fn hex_value(b: Int) -> Int
+    if is_digit(b)
+        b - '0'
+    elif b >= 'a'
+        b - 'a' + 10
+    else
+        b - 'A' + 10
+
+// The UTF-8 bytes of a codepoint.
+fn utf8(cp: Int) -> Str
+    str.from_char(cp)
+
+// `s` with its backslash escapes and its entity references replaced by
+// the characters they stand for: what a link destination, a title and
+// an info string mean (sections 2.4 and 2.5).
+fn unescape(s: Str) -> Str
+    if not (str.contains(s, "\\") or str.contains(s, "&"))
+        return s
+    var parts: [Str] = []
+    let n = str.len(s)
+    var i = 0
+    var run = 0
+    for _ in 0..n + 1
+        if i >= n
+            break
+        let b = str.byte_at_or(s, i, 0)
+        if b == '\\' and is_ascii_punct(str.byte_at_or(s, i + 1, 0))
+            list.push(parts, str.slice(s, run, i))
+            list.push(parts, str.from_byte(str.byte_at_or(s, i + 1, 0)))
+            i = i + 2
+            run = i
+        elif b == '&'
+            let e = entity(s, i, n)
+            if list.len(e.0) > 0
+                list.push(parts, str.slice(s, run, i))
+                for cp in e.0
+                    list.push(parts, utf8(cp))
+                i = e.1
+                run = i
+            else
+                i = i + 1
+        else
+            i = i + 1
+    list.push(parts, str.slice(s, run, n))
+    str.join(parts, "")
+
+// ── Segmented text ────────────────────────────────────────────────────
+
+// The text of a block as the inline parser reads it: pieces of the
+// source, each joined to the next by a line feed or by nothing, with
+// the way back from a position in the joined text to the source.
+//
+// A paragraph inside a block quote is not a substring of the source,
+// because every line but the first carries the quote's `>`.  The joined
+// text leaves those out, and `source_pieces` turns a range of it back
+// into the source ranges it came from.
+struct Segs
+    text: Str
+    // Where each piece starts in `text`.
+    at: [Int]
+    // Where each piece starts in the source.
+    src: [Int]
+    // How long each piece is.
+    len: [Int]
+    // Where the line ending after each piece starts in the source, and
+    // how long it is; a length of 0 means the piece is followed by the
+    // next with nothing between them.
+    join_at: [Int]
+    join_len: [Int]
+
+// Join the source ranges `[starts[i], ends[i])`.  `join_lens[i]` is the
+// length of the line ending after piece `i` in the source, which the
+// joined text writes as one line feed, or 0 for no separator.
+fn segs(source: Str, starts: [Int], ends: [Int], join_lens: [Int]) -> Segs
+    var parts: [Str] = []
+    var at_list: [Int] = []
+    var src: [Int] = []
+    var lens: [Int] = []
+    var join_at: [Int] = []
+    var join_len: [Int] = []
+    var pos = 0
+    let n = list.len(starts)
+    for i in 0..n
+        let a = starts[i]
+        let e = ends[i]
+        list.push(parts, str.slice(source, a, e))
+        list.push(at_list, pos)
+        list.push(src, a)
+        list.push(lens, e - a)
+        pos = pos + (e - a)
+        let jl = if i + 1 < n
+            join_lens[i]
+        else
+            0
+        list.push(join_at, e)
+        list.push(join_len, jl)
+        if jl > 0
+            list.push(parts, "\n")
+            pos = pos + 1
+    Segs { text: str.join(parts, ""), at: at_list, src: src, len: lens, join_at: join_at,
+           join_len: join_len }
+
+// The piece that position `p` of the joined text falls in, or its
+// line ending: the last piece that starts at or before `p`.
+fn seg_of(g: Segs, p: Int) -> Int
+    var lo = 0
+    var hi = list.len(g.at) - 1
+    for _ in 0..64
+        if lo >= hi
+            break
+        let mid = (lo + hi + 1) / 2
+        if g.at[mid] <= p
+            lo = mid
+        else
+            hi = mid - 1
+    lo
+
+// The source position of position `p` of the joined text.
+//
+// A position past the end of a piece is its line ending: the next
+// piece starts one past it, where `seg_of` would find the next piece.
+fn to_source(g: Segs, p: Int) -> Int
+    let k = seg_of(g, p)
+    let off = p - g.at[k]
+    if off < g.len[k]
+        g.src[k] + off
+    else
+        g.join_at[k]
+
+// The source ranges a range of the joined text covers, in order, with
+// a line ending included as its source bytes and neighbours that touch
+// in the source made one.
+//
+// Every range asked for is inside the text and not empty, so the walk
+// ends inside the pieces.
+fn source_pieces(g: Segs, bs: Int, be: Int) -> [(Int, Int)]
+    var out: [(Int, Int)] = []
+    var k = seg_of(g, bs)
+    var p = bs
+    for _ in 0..list.len(g.at)
+        let seg_end = g.at[k] + g.len[k]
+        if p < seg_end
+            let e = if be < seg_end
+                be
+            else
+                seg_end
+            push_piece(out, g.src[k] + (p - g.at[k]), g.src[k] + (e - g.at[k]))
+            p = e
+        if p >= be
+            break
+        if g.join_len[k] > 0 and p == seg_end
+            push_piece(out, g.join_at[k], g.join_at[k] + g.join_len[k])
+            p = p + 1
+        k = k + 1
+    out
+
+fn push_piece(var out: [(Int, Int)], a: Int, e: Int)
+    let n = list.len(out)
+    if n > 0 and out[n - 1].1 == a
+        out[n - 1] = (out[n - 1].0, e)
+    else
+        list.push(out, (a, e))

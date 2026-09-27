@@ -1,0 +1,919 @@
+// mdblock.nv — the block structure of a document (CommonMark section
+// 3 onwards), before any inline content is read.
+//
+// The document is read one line at a time, as the specification's
+// appendix, "A parsing strategy", describes.  Each line first walks the
+// open containers from the outside in, and each container either takes
+// its share of the line's start or closes.  Then new containers and
+// leaves may open, and what is left of the line goes to the innermost
+// open block.  A paragraph line that no container claimed may still be
+// a lazy continuation of an open paragraph.
+//
+// The blocks live in one arena of parallel lists, linked by index, so a
+// block is one entry and not one allocation.  A leaf keeps its lines as
+// ranges into the source.  Link reference definitions are taken off the
+// start of each paragraph when it closes, into a table the inline parser
+// reads.
+
+use std.str
+use std.list
+use mdscan
+
+// The block kinds.
+fn k_doc() -> Int
+    0
+
+fn k_quote() -> Int
+    1
+
+fn k_list() -> Int
+    2
+
+fn k_item() -> Int
+    3
+
+fn k_para() -> Int
+    4
+
+fn k_heading() -> Int
+    5
+
+fn k_fenced() -> Int
+    6
+
+fn k_indented() -> Int
+    7
+
+fn k_html() -> Int
+    8
+
+fn k_rule() -> Int
+    9
+
+fn k_table() -> Int
+    10
+
+fn k_foot() -> Int
+    11
+
+// What the block parser needs from the options.
+struct BlockOpts
+    tables: Bool
+    footnotes: Bool
+    max_nesting: Int
+    max_refs: Int
+
+// The arena.  Entry `i` of every list is block `i`; block 0 is the
+// document.
+//
+// The meaning of `a` to `d` and of the range `r0`, `r1` depends on the
+// kind:
+//
+//   list      a: bullet character, or 0 for ordered; b: start number;
+//             c: delimiter; d: 1 when tight
+//   item      a: marker offset; b: padding
+//   heading   a: level; b: 1 for setext; r0, r1: the content of an ATX
+//             heading
+//   fenced    a: fence character; b: fence length; c: fence indent;
+//             r0, r1: the info string
+//   html      a: the kind of HTML block, 1 to 7
+//   table     c: the index of its alignments in `aligns`
+//   foot      r0, r1: the label
+struct Blocks
+    source: Str
+    opts: BlockOpts
+    var kind: [Int]
+    var parent: [Int]
+    var first: [Int]
+    var last: [Int]
+    var next: [Int]
+    var prev: [Int]
+    var open: [Bool]
+    var blank_end: [Bool]
+    var start: [Int]
+    var stop: [Int]
+    var start_line: [Int]
+    var a: [Int]
+    var b: [Int]
+    var c: [Int]
+    var d: [Int]
+    var r0: [Int]
+    var r1: [Int]
+    var l0: [Int]
+    var l1: [Int]
+    var cut: [Int]
+    // The content lines of every leaf, in the order they were added:
+    // `[ln_start, ln_end)` in the source, `ln_pad` virtual spaces before
+    // it from a tab that was partly consumed, and the length of the line
+    // ending after it.
+    var ln_start: [Int]
+    var ln_end: [Int]
+    var ln_pad: [Int]
+    var ln_join: [Int]
+    var aligns: [[Int]]
+    // The reference definitions: the label key, and for each the label,
+    // the destination and the title as source ranges.
+    var ref_index: HashMap<Str, Int>
+    var ref_label: [(Int, Int)]
+    var ref_dest: [(Int, Int)]
+    var ref_title: [(Int, Int)]
+    var ref_has_title: [Bool]
+    var foot_index: HashMap<Str, Int>
+    var tip: Int
+    var line_no: Int
+    var truncated: Bool
+
+// The state of the line being read, as in the appendix: the byte
+// offset reached, the column it is at, and whether a tab has been
+// partly consumed.
+struct Line
+    s: Str
+    start: Int
+    end: Int
+    next: Int
+    var offset: Int
+    var column: Int
+    var partial: Bool
+    var fns: Int
+    var fns_col: Int
+    var indent: Int
+    var blank: Bool
+
+fn peek(ln: Line, i: Int) -> Int
+    mdscan.at(ln.s, i, ln.end)
+
+fn find_nonspace(var ln: Line)
+    var i = ln.offset
+    var col = ln.column
+    var to_tab = 4 - col % 4
+    for _ in i..ln.end + 1
+        let c = peek(ln, i)
+        if c == ' '
+            i = i + 1
+            col = col + 1
+            to_tab = to_tab - 1
+            if to_tab == 0
+                to_tab = 4
+        elif c == '\t'
+            i = i + 1
+            col = col + to_tab
+            to_tab = 4
+        else
+            break
+    ln.fns = i
+    ln.fns_col = col
+    ln.indent = col - ln.column
+    ln.blank = mdscan.is_line_end(peek(ln, i))
+
+// Move `count` bytes, or `count` columns when `columns`, through the
+// line.  A tab that is only partly consumed is remembered, so the rest
+// of it becomes spaces in the content.
+fn advance(var ln: Line, count: Int, columns: Bool)
+    var n = count
+    for _ in 0..count + 1
+        if n <= 0 or ln.offset >= ln.end
+            break
+        let c = peek(ln, ln.offset)
+        if c == '\t'
+            let to_tab = 4 - ln.column % 4
+            if columns
+                ln.partial = to_tab > n
+                let step = if to_tab > n
+                    n
+                else
+                    to_tab
+                ln.column = ln.column + step
+                if not ln.partial
+                    ln.offset = ln.offset + 1
+                n = n - step
+            else
+                ln.partial = false
+                ln.column = ln.column + to_tab
+                ln.offset = ln.offset + 1
+                n = n - 1
+        else
+            ln.partial = false
+            ln.offset = ln.offset + 1
+            ln.column = ln.column + 1
+            n = n - 1
+
+fn advance_to_nonspace(var ln: Line)
+    advance(ln, ln.fns - ln.offset, false)
+
+// Parse a document's blocks.
+fn parse(source: Str, opts: BlockOpts) -> Blocks
+    var st = Blocks { source: source, opts: opts, kind: [], parent: [], first: [], last: [],
+                      next: [], prev: [], open: [], blank_end: [], start: [], stop: [],
+                      start_line: [], a: [], b: [], c: [], d: [], r0: [], r1: [], l0: [],
+                      l1: [], cut: [], ln_start: [], ln_end: [], ln_pad: [], ln_join: [],
+                      aligns: [], ref_index: HashMap.new(), ref_label: [], ref_dest: [],
+                      ref_title: [], ref_has_title: [], foot_index: HashMap.new(), tip: 0,
+                      line_no: 0, truncated: false }
+    new_block(st, k_doc(), -1, 0)
+    let lines = mdscan.line_table(source)
+    for i in 0..list.len(lines)
+        st.line_no = i + 1
+        let l = lines[i]
+        var ln = Line { s: source, start: l.0, end: l.1, next: l.2, offset: l.0, column: 0,
+                        partial: false, fns: l.0, fns_col: 0, indent: 0, blank: false }
+        process_line(st, ln)
+    for _ in 0..list.len(st.kind)
+        if st.tip < 0
+            break
+        st.tip = finalize(st, st.tip)
+    st
+
+fn new_block(var st: Blocks, kind: Int, parent: Int, start: Int) -> Int
+    let id = list.len(st.kind)
+    list.push(st.kind, kind)
+    list.push(st.parent, parent)
+    list.push(st.first, -1)
+    list.push(st.last, -1)
+    list.push(st.next, -1)
+    list.push(st.prev, -1)
+    list.push(st.open, true)
+    list.push(st.blank_end, false)
+    list.push(st.start, start)
+    list.push(st.stop, start)
+    list.push(st.start_line, st.line_no)
+    list.push(st.a, 0)
+    list.push(st.b, 0)
+    list.push(st.c, 0)
+    list.push(st.d, 0)
+    list.push(st.r0, 0)
+    list.push(st.r1, 0)
+    list.push(st.l0, list.len(st.ln_start))
+    list.push(st.l1, list.len(st.ln_start))
+    list.push(st.cut, -1)
+    if parent >= 0
+        let lc = st.last[parent]
+        if lc >= 0
+            st.next[lc] = id
+            st.prev[id] = lc
+        else
+            st.first[parent] = id
+        st.last[parent] = id
+    id
+
+fn is_container(kind: Int) -> Bool
+    kind == k_doc() or kind == k_quote() or kind == k_list() or kind == k_item()
+        or kind == k_foot()
+
+fn can_contain(parent: Int, child: Int) -> Bool
+    if parent == k_list()
+        return child == k_item()
+    parent == k_doc() or parent == k_quote() or parent == k_item() or parent == k_foot()
+
+// How many containers enclose block `id`, itself included.
+fn depth_of(st: Blocks, id: Int) -> Int
+    var n = 0
+    var at = id
+    for _ in 0..list.len(st.kind)
+        if at <= 0
+            break
+        if is_container(st.kind[at])
+            n = n + 1
+        at = st.parent[at]
+    n
+
+// Open a block of `kind` under `parent`, closing whatever cannot hold
+// it first.
+fn add_child(var st: Blocks, parent: Int, kind: Int, start: Int) -> Int
+    var p = parent
+    for _ in 0..list.len(st.kind)
+        if can_contain(st.kind[p], kind)
+            break
+        p = finalize(st, p)
+    new_block(st, kind, p, start)
+
+// Whether a new container under `parent` stays within the nesting
+// bound.  Past it, the bound is recorded and the line's remaining text
+// is read as a paragraph.
+fn room_for(var st: Blocks, parent: Int) -> Bool
+    if depth_of(st, parent) + 1 > st.opts.max_nesting
+        st.truncated = true
+        return false
+    true
+
+fn add_line(var st: Blocks, id: Int, ln: Line, from: Int, pad: Int)
+    list.push(st.ln_start, from)
+    list.push(st.ln_end, ln.end)
+    list.push(st.ln_pad, pad)
+    list.push(st.ln_join, ln.next - ln.end)
+    st.l1[id] = list.len(st.ln_start)
+
+// Add the rest of the line from the current offset, turning a partly
+// consumed tab into the spaces it still stands for.
+fn add_rest(var st: Blocks, id: Int, var ln: Line)
+    var pad = 0
+    if ln.partial
+        pad = 4 - ln.column % 4
+        ln.offset = ln.offset + 1
+    add_line(st, id, ln, ln.offset, pad)
+
+fn process_line(var st: Blocks, var ln: Line)
+    // 1. The open containers, from the outside in.
+    var container = 0
+    var all_matched = true
+    for _ in 0..list.len(st.kind)
+        let child = st.last[container]
+        if child < 0 or not st.open[child]
+            break
+        find_nonspace(ln)
+        let verdict = continues(st, child, ln)
+        if verdict == 2
+            return
+        if verdict == 0
+            all_matched = false
+            break
+        container = child
+    let last_matched = container
+    // 2. New containers and leaves.
+    var maybe_lazy = st.kind[st.tip] == k_para()
+    for _ in 0..ln.end - ln.start + 2
+        let ck = st.kind[container]
+        if ck == k_fenced() or ck == k_indented() or ck == k_html()
+            break
+        find_nonspace(ln)
+        let indented = ln.indent >= 4
+        let c = peek(ln, ln.fns)
+        if not indented and c == '>'
+            if not room_for(st, container)
+                break
+            let at = ln.fns
+            advance_to_nonspace(ln)
+            advance(ln, 1, false)
+            if mdscan.is_space_or_tab(peek(ln, ln.offset))
+                advance(ln, 1, true)
+            container = add_child(st, container, k_quote(), at)
+        elif not indented and mdscan.atx_level(ln.s, ln.fns, ln.end) > 0
+            let level = mdscan.atx_level(ln.s, ln.fns, ln.end)
+            let body = mdscan.atx_content(ln.s, ln.fns, ln.end, level)
+            container = add_child(st, container, k_heading(), ln.fns)
+            st.a[container] = level
+            st.r0[container] = body.0
+            st.r1[container] = body.1
+            ln.offset = ln.end
+            break
+        elif not indented and mdscan.fence_open(ln.s, ln.fns, ln.end).1 > 0
+            let f = mdscan.fence_open(ln.s, ln.fns, ln.end)
+            let fence_indent = ln.fns - ln.offset
+            container = add_child(st, container, k_fenced(), ln.fns)
+            st.a[container] = f.0
+            st.b[container] = f.1
+            st.c[container] = fence_indent
+            let info = trimmed(ln.s, ln.fns + f.1, ln.end)
+            st.r0[container] = info.0
+            st.r1[container] = info.1
+            ln.offset = ln.end
+            break
+        elif not indented and mdscan.html_block_start(ln.s, ln.fns, ln.end,
+                                                       st.kind[container] != k_para()) > 0
+            let kind = mdscan.html_block_start(ln.s, ln.fns, ln.end, st.kind[container] != k_para())
+            container = add_child(st, container, k_html(), ln.fns)
+            st.a[container] = kind
+            break
+        elif not indented and st.kind[container] == k_para()
+                and mdscan.setext_level(ln.s, ln.fns, ln.end) > 0
+            let level = mdscan.setext_level(ln.s, ln.fns, ln.end)
+            if take_refs(st, container)
+                st.kind[container] = k_heading()
+                st.a[container] = level
+                st.b[container] = 1
+                ln.offset = ln.end
+                break
+            break
+        elif not indented and mdscan.thematic_break(ln.s, ln.fns, ln.end)
+            container = add_child(st, container, k_rule(), ln.fns)
+            ln.offset = ln.end
+            break
+        elif not indented and st.opts.tables and st.kind[container] == k_para()
+                and table_start(st, container, ln) >= 0
+            container = st.last[st.parent[container]]
+            ln.offset = ln.end
+            break
+        elif not indented and st.opts.footnotes and footnote_start(ln) > 0
+            if not room_for(st, container)
+                break
+            let label_end = footnote_start(ln)
+            let at = ln.fns
+            container = add_child(st, container, k_foot(), at)
+            st.r0[container] = at + 2
+            st.r1[container] = label_end
+            st.foot_index.set(mdscan.label_key(str.slice(ln.s, at + 2, label_end)), container)
+            advance(ln, label_end + 2 - ln.offset, false)
+            find_nonspace(ln)
+            advance_to_nonspace(ln)
+        elif not indented and list_marker(ln, st.kind[container] == k_para()).0 > 0
+            if not room_for(st, container)
+                break
+            let m = list_marker(ln, st.kind[container] == k_para())
+            let marker_offset = ln.indent
+            let at = ln.fns
+            advance(ln, ln.fns + m.0 - ln.offset, false)
+            let save_offset = ln.offset
+            let save_column = ln.column
+            let save_partial = ln.partial
+            for _ in 0..6
+                if ln.column - save_column > 5 or not mdscan.is_space_or_tab(peek(ln, ln.offset))
+                    break
+                advance(ln, 1, true)
+            let spaces = ln.column - save_column
+            var padding = m.0 + spaces
+            if spaces >= 5 or spaces < 1 or mdscan.is_line_end(peek(ln, ln.offset))
+                padding = m.0 + 1
+                ln.offset = save_offset
+                ln.column = save_column
+                ln.partial = save_partial
+                if spaces > 0
+                    advance(ln, 1, true)
+            if st.kind[container] != k_list() or not lists_match(st, container, m)
+                if depth_of(st, container) + 2 > st.opts.max_nesting
+                    st.truncated = true
+                    break
+                container = add_child(st, container, k_list(), at)
+                st.a[container] = m.1
+                st.b[container] = m.2
+                st.c[container] = m.3
+            container = add_child(st, container, k_item(), at)
+            st.a[container] = marker_offset
+            st.b[container] = padding
+        elif indented and not maybe_lazy and not ln.blank
+            advance(ln, 4, true)
+            container = add_child(st, container, k_indented(), ln.offset)
+            break
+        else
+            break
+        maybe_lazy = false
+    // 3. The rest of the line.
+    find_nonspace(ln)
+    let ck = st.kind[container]
+    if ln.blank and st.last[container] >= 0
+        st.blank_end[st.last[container]] = true
+    let item_just_opened = ck == k_item() and st.first[container] < 0
+                           and st.start_line[container] == st.line_no
+    st.blank_end[container] = ln.blank and ck != k_quote() and ck != k_heading()
+                              and ck != k_rule() and ck != k_fenced() and not item_just_opened
+    var up = st.parent[container]
+    for _ in 0..list.len(st.kind)
+        if up < 0
+            break
+        st.blank_end[up] = false
+        up = st.parent[up]
+    if st.tip != last_matched and container == last_matched and not ln.blank
+            and st.kind[st.tip] == k_para() and st.open[st.tip]
+        add_line(st, st.tip, ln, ln.fns, 0)
+        extend(st, st.tip, ln.next)
+        return
+    var t = st.tip
+    for _ in 0..list.len(st.kind)
+        if t == last_matched or t < 0
+            break
+        if st.open[t]
+            finalize(st, t)
+        t = st.parent[t]
+    st.tip = container
+    if ck == k_indented() or ck == k_fenced()
+        if ck == k_fenced() and st.start_line[container] == st.line_no
+            extend(st, container, ln.next)
+            return
+        add_rest(st, container, ln)
+    elif ck == k_html()
+        add_rest(st, container, ln)
+        let kind = st.a[container]
+        if kind >= 1 and kind <= 5 and mdscan.html_block_ends(ln.s, ln.fns, ln.end, kind)
+            extend(st, container, ln.next)
+            st.tip = finalize(st, container)
+            return
+    elif not ln.blank and ck != k_heading() and ck != k_rule()
+        if ck == k_table()
+            if st.start_line[container] != st.line_no
+                add_line(st, container, ln, ln.fns, 0)
+        elif ck == k_para()
+            add_line(st, container, ln, ln.fns, 0)
+        else
+            let p = add_child(st, container, k_para(), ln.fns)
+            add_line(st, p, ln, ln.fns, 0)
+            st.tip = p
+    extend(st, st.tip, ln.next)
+
+// Stretch the spans of `id` and every block around it to `stop`.
+fn extend(var st: Blocks, id: Int, stop: Int)
+    var at = id
+    for _ in 0..list.len(st.kind)
+        if at < 0
+            break
+        if st.stop[at] < stop
+            st.stop[at] = stop
+        at = st.parent[at]
+
+// Whether open block `id` continues on this line: 1 when it does, with
+// the line advanced past its share, 0 when it does not, and 2 when the
+// line closed it and nothing more is to be read from the line.
+fn continues(var st: Blocks, id: Int, var ln: Line) -> Int
+    let kind = st.kind[id]
+    if kind == k_quote()
+        if ln.indent < 4 and peek(ln, ln.fns) == '>'
+            advance_to_nonspace(ln)
+            advance(ln, 1, false)
+            if mdscan.is_space_or_tab(peek(ln, ln.offset))
+                advance(ln, 1, true)
+            return 1
+        return 0
+    if kind == k_item()
+        let need = st.a[id] + st.b[id]
+        if ln.indent >= need
+            advance(ln, need, true)
+            return 1
+        if ln.blank and st.first[id] >= 0
+            advance_to_nonspace(ln)
+            return 1
+        return 0
+    if kind == k_foot()
+        if ln.indent >= 4
+            advance(ln, 4, true)
+            return 1
+        if ln.blank
+            advance_to_nonspace(ln)
+            return 1
+        return 0
+    if kind == k_indented()
+        if ln.indent >= 4
+            advance(ln, 4, true)
+            return 1
+        if ln.blank
+            advance_to_nonspace(ln)
+            return 1
+        return 0
+    if kind == k_fenced()
+        if ln.indent < 4 and mdscan.fence_close(ln.s, ln.fns, ln.end, st.a[id], st.b[id])
+            extend(st, id, ln.next)
+            st.tip = finalize(st, id)
+            return 2
+        var i = st.c[id]
+        for _ in 0..st.c[id] + 1
+            if i <= 0 or not mdscan.is_space_or_tab(peek(ln, ln.offset))
+                break
+            advance(ln, 1, true)
+            i = i - 1
+        return 1
+    if kind == k_html()
+        let k = st.a[id]
+        if ln.blank and (k == 6 or k == 7)
+            return 0
+        return 1
+    if kind == k_para()
+        if ln.blank
+            0
+        else
+            1
+    elif kind == k_table()
+        if ln.blank or interrupts_table(ln)
+            0
+        else
+            1
+    elif kind == k_list()
+        1
+    else
+        0
+
+// Whether a line would start a block other than a paragraph, which
+// ends a table (GFM section 4.10).
+fn interrupts_table(ln: Line) -> Bool
+    let c = peek(ln, ln.fns)
+    c == '>' or mdscan.atx_level(ln.s, ln.fns, ln.end) > 0
+        or mdscan.fence_open(ln.s, ln.fns, ln.end).1 > 0
+        or mdscan.html_block_start(ln.s, ln.fns, ln.end, false) > 0
+        or mdscan.thematic_break(ln.s, ln.fns, ln.end)
+        or list_marker(ln, true).0 > 0
+
+fn trimmed(s: Str, a: Int, e: Int) -> (Int, Int)
+    var x = a
+    var y = e
+    for _ in a..e
+        if not mdscan.is_space_or_tab(mdscan.at(s, x, e))
+            break
+        x = x + 1
+    for _ in x..e
+        if not mdscan.is_space_or_tab(mdscan.at(s, y - 1, e))
+            break
+        y = y - 1
+    (x, y)
+
+// A list marker at the line's first non-space (section 5.2), as
+// `(width, bullet character, start number, delimiter)`, or a width of
+// 0.  A marker that would interrupt a paragraph must start an item
+// with content, and an ordered one must start at 1.
+fn list_marker(ln: Line, interrupts: Bool) -> (Int, Int, Int, Int)
+    let i = ln.fns
+    let c = peek(ln, i)
+    if c == '*' or c == '+' or c == '-'
+        let after = peek(ln, i + 1)
+        if not (mdscan.is_space_or_tab(after) or mdscan.is_line_end(after))
+            return (0, 0, 0, 0)
+        if interrupts and mdscan.blank_from(ln.s, i + 1, ln.end)
+            return (0, 0, 0, 0)
+        return (1, c, 0, 0)
+    var n = 0
+    var v = 0
+    for _ in 0..10
+        let b = peek(ln, i + n)
+        if not mdscan.is_digit(b)
+            break
+        v = v * 10 + (b - '0')
+        n = n + 1
+    if n == 0 or n > 9
+        return (0, 0, 0, 0)
+    let delim = peek(ln, i + n)
+    if delim != '.' and delim != ')'
+        return (0, 0, 0, 0)
+    let after = peek(ln, i + n + 1)
+    if not (mdscan.is_space_or_tab(after) or mdscan.is_line_end(after))
+        return (0, 0, 0, 0)
+    if interrupts and (v != 1 or mdscan.blank_from(ln.s, i + n + 1, ln.end))
+        return (0, 0, 0, 0)
+    (n + 1, 0, v, delim)
+
+fn lists_match(st: Blocks, list_id: Int, m: (Int, Int, Int, Int)) -> Bool
+    if m.1 != 0
+        return st.a[list_id] == m.1
+    st.a[list_id] == 0 and st.c[list_id] == m.3
+
+// A footnote definition's `[^label]:` at the first non-space, as the
+// end of the label, or 0.
+fn footnote_start(ln: Line) -> Int
+    if peek(ln, ln.fns) != '[' or peek(ln, ln.fns + 1) != '^'
+        return 0
+    var k = ln.fns + 2
+    for _ in k..ln.end
+        let b = peek(ln, k)
+        if b == ']'
+            break
+        if b < 0 or mdscan.is_ascii_space(b) or b == '['
+            return 0
+        k = k + 1
+    if k == ln.fns + 2 or peek(ln, k) != ']' or peek(ln, k + 1) != ':'
+        return 0
+    k
+
+// ── Closing blocks ────────────────────────────────────────────────────
+
+// Close block `id` and answer its parent.
+fn finalize(var st: Blocks, id: Int) -> Int
+    st.open[id] = false
+    let kind = st.kind[id]
+    let parent = st.parent[id]
+    if kind == k_para()
+        if not take_refs(st, id)
+            unlink(st, id)
+    elif kind == k_indented()
+        // The first line is not blank, so the walk stops by it.
+        var e = st.l1[id]
+        for _ in st.l0[id]..st.l1[id]
+            if not mdscan.blank_from(st.source, st.ln_start[e - 1], st.ln_end[e - 1])
+                break
+            e = e - 1
+        st.l1[id] = e
+    elif kind == k_list()
+        st.d[id] = if list_tight(st, id)
+            1
+        else
+            0
+    parent
+
+// Take block `id` out of the tree.  It is always its parent's last
+// child: a paragraph is unlinked when it closes, before anything is
+// added after it.
+fn unlink(var st: Blocks, id: Int)
+    let p = st.parent[id]
+    let pv = st.prev[id]
+    if pv >= 0
+        st.next[pv] = -1
+    else
+        st.first[p] = -1
+    st.last[p] = pv
+    if st.tip == id
+        st.tip = p
+
+// Whether a block's last line was blank, looking into the last item of
+// a list and the last block of an item.
+fn ends_blank(st: Blocks, id: Int) -> Bool
+    var at = id
+    var blank = false
+    for _ in 0..list.len(st.kind)
+        if at < 0
+            break
+        if st.blank_end[at]
+            blank = true
+            break
+        let k = st.kind[at]
+        if k != k_list() and k != k_item()
+            break
+        at = st.last[at]
+    blank
+
+// A list is loose when an item that is not the last ends with a blank
+// line, or when two blocks inside one item have a blank line between
+// them (section 5.3).
+fn list_tight(st: Blocks, id: Int) -> Bool
+    var item = st.first[id]
+    for _ in 0..list.len(st.kind)
+        if item < 0
+            break
+        if st.blank_end[item] and st.next[item] >= 0
+            return false
+        var sub = st.first[item]
+        for _ in 0..list.len(st.kind)
+            if sub < 0
+                break
+            if (st.next[item] >= 0 or st.next[sub] >= 0) and ends_blank(st, sub)
+                return false
+            sub = st.next[sub]
+        item = st.next[item]
+    true
+
+// ── Link reference definitions (section 4.7) ──────────────────────────
+
+// The text of leaf `id`'s lines, joined.
+fn leaf_segs(st: Blocks, id: Int) -> mdscan.Segs
+    var starts: [Int] = []
+    var ends: [Int] = []
+    var joins: [Int] = []
+    for k in st.l0[id]..st.l1[id]
+        let s = if k == st.l0[id] and st.cut[id] >= 0
+            st.cut[id]
+        else
+            st.ln_start[k]
+        list.push(starts, s)
+        list.push(ends, st.ln_end[k])
+        list.push(joins, (if st.ln_join[k] > 0 then st.ln_join[k] else 1))
+    mdscan.segs(st.source, starts, ends, joins)
+
+// Take the reference definitions off the start of paragraph `id`.
+// False when nothing but definitions was in it.
+fn take_refs(var st: Blocks, id: Int) -> Bool
+    let g = leaf_segs(st, id)
+    let text = g.text
+    let n = str.len(text)
+    if mdscan.at(text, 0, n) != '['
+        return true
+    var pos = 0
+    for _ in 0..n
+        let r = ref_def(text, pos, n)
+        if r.0 < 0
+            break
+        let key = mdscan.label_key(str.slice(text, r.1 + 1, r.2 - 1))
+        if not st.ref_index.has(key)
+            if list.len(st.ref_label) >= st.opts.max_refs
+                st.truncated = true
+            else
+                st.ref_index.set(key, list.len(st.ref_label))
+                list.push(st.ref_label, (mdscan.to_source(g, r.1 + 1), mdscan.to_source(g, r.2 - 1)))
+                list.push(st.ref_dest, (mdscan.to_source(g, r.3), mdscan.to_source(g, r.4)))
+                list.push(st.ref_title, (mdscan.to_source(g, r.5), mdscan.to_source(g, r.6)))
+                list.push(st.ref_has_title, r.7)
+        pos = r.0
+        if pos >= n
+            break
+    if pos == 0
+        return true
+    if pos >= n
+        st.l0[id] = st.l1[id]
+        return false
+    let k = mdscan.seg_of(g, pos)
+    st.l0[id] = st.l0[id] + k
+    st.cut[id] = g.src[k] + (pos - g.at[k])
+    st.start[id] = st.cut[id]
+    true
+
+// One definition at `pos`: `(next, label start, label end, destination
+// start, destination end, title start, title end, has title)`, with a
+// `next` of -1 when there is none.  `next` is the start of the line
+// after the definition.
+fn ref_def(s: Str, pos: Int, n: Int) -> (Int, Int, Int, Int, Int, Int, Int, Bool)
+    let fail = (-1, 0, 0, 0, 0, 0, 0, false)
+    let lab = mdscan.link_label(s, pos, n)
+    if lab < 0 or mdscan.at(s, lab, n) != ':'
+        return fail
+    let d_at = mdscan.skip_spnl(s, lab + 1, n)
+    let dest = mdscan.link_destination(s, d_at, n)
+    if dest.2 < 0 or dest.1 == dest.0 and mdscan.at(s, d_at, n) != '<'
+        return fail
+    let t_at = mdscan.skip_spnl(s, dest.2, n)
+    if t_at > dest.2
+        let title = mdscan.link_title(s, t_at, n)
+        if title.2 >= 0
+            let after = line_end_after(s, title.2, n)
+            if after >= 0
+                return (after, pos, lab, dest.0, dest.1, title.0, title.1, true)
+    let plain = line_end_after(s, dest.2, n)
+    if plain < 0
+        return fail
+    (plain, pos, lab, dest.0, dest.1, dest.1, dest.1, false)
+
+// The start of the next line when only spaces and tabs follow `i` on
+// its line, or -1.
+fn line_end_after(s: Str, i: Int, n: Int) -> Int
+    var k = i
+    for _ in i..n
+        let b = mdscan.at(s, k, n)
+        if b == '\n'
+            return k + 1
+        if not mdscan.is_space_or_tab(b)
+            return -1
+        k = k + 1
+    n
+
+// ── Tables (GFM section 4.10) ─────────────────────────────────────────
+
+// The cells of a table row `[a, e)`, as their ranges, split at every
+// `|` that is not escaped.  A leading and a trailing `|` open and close
+// the row rather than delimiting an empty cell.
+fn row_cells(s: Str, a: Int, e: Int) -> [(Int, Int)]
+    var out: [(Int, Int)] = []
+    let t = trimmed(s, a, e)
+    var x = t.0
+    var y = t.1
+    if mdscan.at(s, x, y) == '|'
+        x = x + 1
+    if y > x and mdscan.at(s, y - 1, y) == '|' and mdscan.at(s, y - 2, y) != '\\'
+        y = y - 1
+    var cell = x
+    var k = x
+    for _ in x..y + 1
+        if k >= y
+            break
+        let b = mdscan.at(s, k, y)
+        if b == '\\'
+            k = k + 2
+            continue
+        if b == '|'
+            list.push(out, trimmed(s, cell, k))
+            cell = k + 1
+        k = k + 1
+    list.push(out, trimmed(s, cell, y))
+    out
+
+// The alignments of a delimiter row, or an empty list when the line is
+// not one: 0 none, 1 left, 2 centre, 3 right.
+fn delimiter_row(s: Str, a: Int, e: Int) -> [Int]
+    var out: [Int] = []
+    var none: [Int] = []
+    var pipe = false
+    for k in a..e
+        if str.byte_at_or(s, k, 0) == '|'
+            pipe = true
+    for c in row_cells(s, a, e)
+        let x = c.0
+        let y = c.1
+        if y <= x
+            return none
+        let left = mdscan.at(s, x, y) == ':'
+        let right = mdscan.at(s, y - 1, y) == ':'
+        let from = if left
+            x + 1
+        else
+            x
+        let to = if right
+            y - 1
+        else
+            y
+        if to <= from
+            return none
+        for k in from..to
+            if str.byte_at_or(s, k, 0) != '-'
+                return none
+        list.push(out, (if left and right then 2 elif left then 1 elif right then 3 else 0))
+    if not pipe and list.len(out) < 2
+        return none
+    out
+
+// Open a table when the line is a delimiter row whose cell count is
+// the header's, the header being the last line of paragraph `para`.
+fn table_start(var st: Blocks, para: Int, ln: Line) -> Int
+    let n = st.l1[para]
+    var aligns = delimiter_row(ln.s, ln.fns, ln.end)
+    if list.len(aligns) == 0
+        return -1
+    let h = n - 1
+    let hs = if h == st.l0[para] and st.cut[para] >= 0
+        st.cut[para]
+    else
+        st.ln_start[h]
+    let header = row_cells(st.source, hs, st.ln_end[h])
+    if list.len(header) != list.len(aligns)
+        return -1
+    let header_start = hs
+    st.l1[para] = h
+    let parent = st.parent[para]
+    if st.l1[para] <= st.l0[para]
+        unlink(st, para)
+        st.open[para] = false
+    else
+        finalize(st, para)
+    let id = new_block(st, k_table(), parent, header_start)
+    st.l0[id] = h
+    st.l1[id] = h + 1
+    st.c[id] = list.len(st.aligns)
+    list.push(st.aligns, aligns)
+    id

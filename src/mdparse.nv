@@ -1,69 +1,54 @@
-// mdparse.nv — CommonMark as a pull parser: events out, one at a
-// time, over a source string the caller keeps.
+// mdparse.nv — CommonMark as a pull parser: events out, one at a time,
+// over a source string the caller keeps.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Every event carries a byte range into the caller's source rather than
+// a copied string, so a caller that wants the text slices the source it
+// already holds.  Some text is not a substring of the source: `&amp;`
+// is one ampersand and `\*` one asterisk.  Those arrive as `MdChar`,
+// the decoded codepoint, so a renderer handles two text events,
+// `MdText` for verbatim runs and `MdChar` for decoded characters.
+//
+// CommonMark has no parse errors (section 2): every sequence of bytes is
+// a document.  What this parser has instead is a set of bounds,
+// `MdLimits`.  A document past one has the excess read as literal text,
+// and `parser_truncated` reports it.
+//
+// The document is read when the parser is made: the block structure
+// first (`mdblock`), then the inline content of every leaf
+// (`mdinline`), into the list of events `next` hands out.  CommonMark
+// needs the whole document before it can say what a link means, since
+// a reference definition may come after its use, and before it can say
+// whether a list is loose.
 
-use uclass
-use ucase
-
-// WHY A PULL PARSER AND NOT A TREE.  A renderer, a table-of-contents
-// builder, a link checker and a search indexer all want to walk the
-// document once and act on what goes past.  A tree makes every one of
-// them allocate the whole document first, and the site generator that
-// asked for this package renders 58 pages per build.  The tree is
-// `mdtree`, built from these events, for the callers that genuinely
-// need to look backwards.
-//
-// EVERY EVENT CARRIES A BYTE RANGE, NOT A STRING.  `MdRange` is an
-// offset pair into the source the caller already holds, so the parser
-// allocates nothing per event and a caller that wants the text slices
-// it.  That is the difference between a parser that can be `core` and
-// one that cannot.
-//
-// THE HONEST EXCEPTION IS `MdChar`.  Some text in a Markdown document
-// is not a substring of the document: `&amp;` is one ampersand,
-// `\*` is one asterisk, and neither appears in the source as the
-// character it means.  A parser that returned only ranges would have
-// to lie about those, and one that returned strings would allocate for
-// every document.  So there are two text events — `MdText(MdRange)`
-// for the verbatim runs and `MdChar(Int)` for the decoded ones — and a
-// renderer handles both.  pulldown-cmark solves the same problem with
-// a copy-on-write string; this is the same answer without the string.
-//
-// CommonMark HAS NO PARSE ERRORS.  Every sequence of bytes is a valid
-// document, so there is no error type here and no `Result` anywhere.
-// What there is instead is a bounded machine: `MdLimits` caps the
-// nesting depth and the number of open blocks, a document that exceeds
-// them has the excess rendered as literal text, and
-// `parser_truncated` says so afterwards. A `core` parser with an
-// unbounded recursion is a `core` parser with a stack overflow.
+use std.str
+use std.list
+use mdscan
+use mdblock
+use mdinline
 
 // MdRange is a byte range into the source the caller holds.
 //
-// `start` inclusive, `end` exclusive.  An empty range — `start` equal
-// to `end` — is how an event that has no text of its own reports its
-// position, which is what a caller building source maps needs.
+// `start` inclusive, `end` exclusive.  An event with no text of its own
+// reports its position as an empty range, and an absent range, such as
+// a heading with no anchor, is `MdRange { start: 0, end: 0 }`.
 pub struct MdRange
     start: Int
     end: Int
 
 // MdListKind says what kind of list an item belongs to.
 pub enum MdListKind
-    // A bullet list, and which character opened it — `-`, `+` or `*`.
-    // The character matters: CommonMark ends a list and starts a new
-    // one when it changes.
+    // A bullet list, and the character that opened it: `-`, `+` or `*`.
+    // A different character starts a new list (section 5.3).
     ListBullet(marker: Int)
-    // An ordered list, its first number and its delimiter (`.` or
-    // `)`).  The start number is carried because `<ol start="7">` is
-    // what a document beginning at 7 means.
+    // An ordered list, its first number and its delimiter, `.` or `)`.
     ListOrdered(start: Int, delimiter: Int)
 
 // MdCodeKind says how a code block was written.
 pub enum MdCodeKind
-    // Fenced, with its info string — the "novo" in ```novo.  Empty
-    // when there was none.
+    // Fenced, with its info string: the `novo` in ```` ```novo ````.  An
+    // empty range when there was none.
     CodeFenced(info: MdRange)
-    // Indented by four spaces.  No info string, ever.
+    // Indented by four spaces.
     CodeIndented
 
 // MdAlign is a GFM table column's alignment, from its delimiter row.
@@ -75,42 +60,45 @@ pub enum MdAlign
 
 // MdLink is the destination and title of a link or an image.
 //
-// Both are ranges into the source, EXCEPT when the destination came
-// from a link reference definition elsewhere in the document — then
-// the range points at the definition rather than at the use, which is
-// what lets a caller report where a broken link was defined.
+// Both are ranges into the source.  When the destination came from a
+// link reference definition, the ranges point at the definition rather
+// than at the use.  The ranges hold the text as written; a renderer
+// replaces its backslash escapes and entity references.
 pub struct MdLink
     destination: MdRange
-    // Empty when the link had no title.
+    // An empty range when the link had no title.
     title: MdRange
-    // True when the destination came from a reference definition
-    // rather than from the brackets at the point of use.  A link
-    // checker wants to know; a renderer does not.
+    // True when the destination came from a reference definition rather
+    // than from the brackets at the point of use.
     from_reference: Bool
+    // Text that goes before the destination and is not in the source:
+    // `mailto:` for an email autolink, `http://` for a GFM `www.`
+    // autolink, and empty otherwise.
+    prefix: Str
+    // True for an autolink, whose destination is its own text, taken as
+    // written: a backslash in it is not an escape (section 6.5).
+    autolink: Bool
 
 // MdTag is a container that opens and closes.
 //
-// Every `MdTag` appears twice in the event stream — once in
-// `MdStart` and once in `MdEnd` — and the two always match, even when
-// the document did not close what it opened.  That invariant is what
-// lets a renderer keep no stack of its own.
+// Every `MdTag` appears twice in the event stream, once in `MdStart`
+// and once in `MdEnd`, and the two always match, even when the document
+// did not close what it opened.
 pub enum MdTag
     TagParagraph
-    // An ATX or setext heading, its level 1 to 6, and the explicit
-    // anchor a `{#id}` suffix gave it — empty when there was none.
-    // Pandoc's anchor syntax rather than CommonMark's, because the
-    // documentation this package has to render uses it.
+    // An ATX or setext heading, its level 1 to 6, and the anchor a
+    // `{#id}` suffix gave it, which is an empty range when there was
+    // none.
     TagHeading(level: Int, anchor: MdRange)
     TagBlockQuote
     TagCodeBlock(kind: MdCodeKind)
-    // A list, and whether it is loose — a loose list wraps its items'
-    // contents in paragraphs and a tight one does not, which is the
-    // rule that cannot be decided until the list has ended.
+    // A list, and whether it is loose.  A loose list wraps its items'
+    // contents in paragraphs and a tight one does not (section 5.3).
     TagList(kind: MdListKind, loose: Bool)
     TagItem
-    // A GFM table and its columns' alignments, read from the
-    // delimiter row.
+    // A GFM table and its columns' alignments.
     TagTable(alignments: [MdAlign])
+    // The header row.  Its cells are its direct children.
     TagTableHead
     TagTableRow
     TagTableCell
@@ -131,51 +119,46 @@ pub enum MdEvent
     MdEnd(tag: MdTag)
     // A verbatim run of source text.
     MdText(text: MdRange)
-    // One decoded character: a character reference like `&amp;`, or a
-    // backslash escape.  The honest half of the zero-copy design.
+    // One decoded character: a character reference like `&amp;`, a
+    // backslash escape, a smart punctuation mark, or a space a tab
+    // stands for at the start of a code line.
     MdChar(ch: Int)
-    // The contents of a code span or a code block, verbatim.
-    // Separate from `MdText` because nothing inside it is markup and a
-    // renderer must not look for any.
+    // The contents of a code span or a line of a code block, verbatim.
+    // A code span that crosses a line of a container arrives as several
+    // `MdCode` events in a row; a renderer joins them.
     MdCode(text: MdRange)
-    // Raw HTML the document wrote.  A renderer decides whether to
-    // emit it or escape it, and `mdhtml`'s default is to escape —
-    // see that module's comment for why.
+    // Raw HTML the document wrote: a line of an HTML block, or an
+    // inline tag.
     MdHtml(text: MdRange)
-    // A line ending inside a paragraph.  A renderer emits a space or a
-    // newline; it is NOT a paragraph break.
+    // A line ending inside a paragraph, which a renderer writes as a
+    // line ending or a space.  It is not a paragraph break.
     MdSoftBreak
-    // Two trailing spaces or a trailing backslash: `<br>`.
+    // Two trailing spaces or a trailing backslash: `<br />`.
     MdHardBreak
-    // A thematic break — `---`, `***`, `___`.
+    // A thematic break: `---`, `***`, `___`.
     MdRule
-    // A GFM task list marker at the start of an item, and whether it
-    // was checked.
+    // A GFM task list marker at the start of an item's first paragraph,
+    // and whether it was checked.
     MdTaskMarker(checked: Bool)
     // A GFM footnote reference and its label.
     MdFootnoteRef(label: MdRange)
 
-// MdLimits bounds what the parser will do, so that a `core` parser
-// cannot be made to overflow its stack by a document.
+// MdLimits bounds what the parser will do.
 pub struct MdLimits
-    // How deeply containers may nest — block quotes inside lists
-    // inside block quotes.  Beyond it, the opener is literal text.
+    // How deeply containers may nest: block quotes, lists, list items
+    // and footnote definitions inside one another.  Beyond it, the
+    // opener is literal text.
     max_nesting: Int
-    // How many link reference definitions are remembered.  A document
-    // with more is not refused; the ones past the cap do not resolve,
-    // and `parser_truncated` is true.
+    // How many link reference definitions are remembered.  The ones
+    // past the bound do not resolve.
     max_reference_definitions: Int
-    // How many delimiters the emphasis matcher will hold open.  The
-    // pathological CommonMark inputs are all a long run of `*`.
+    // How many emphasis delimiters one block holds open.  The ones past
+    // the bound are literal text.
     max_delimiters: Int
 
 // MdOptions turns the extensions on and off.
-//
-// Every one of them is off by default except tables, because tables
-// are what the row on the plan asked for and because a document with a
-// pipe table in it is not readable as CommonMark's paragraphs.
 pub struct MdOptions
-    // GFM pipe tables.  On by default.
+    // GFM pipe tables.
     var tables: Bool
     // GFM `~~strikethrough~~`.
     var strikethrough: Bool
@@ -183,70 +166,97 @@ pub struct MdOptions
     var task_lists: Bool
     // GFM footnotes, `[^1]`.
     var footnotes: Bool
-    // GFM autolinks: a bare URL becomes a link.  Off by default
-    // because it changes the meaning of text nobody marked up.
+    // GFM extended autolinks: a bare `www.`, `http://` or `https://`
+    // address becomes a link.
     var autolinks: Bool
-    // Pandoc's `{#id}` heading anchors.  On by default, because the
-    // documentation this package exists to render uses them and
-    // because the syntax is inert in a renderer that ignores it.
+    // Pandoc's `{#id}` heading anchors.
     var heading_anchors: Bool
-    // Smart punctuation: quotes to curly ones, `--` to an en dash.
-    // Off by default.  A renderer that rewrites a user's punctuation
-    // inside a code sample is a renderer that corrupts code samples.
+    // Smart punctuation: straight quotes to curly ones, `--` to an en
+    // dash, `---` to an em dash and `...` to an ellipsis.
     var smart_punctuation: Bool
     var limits: MdLimits
 
-// MdParser is the parser's whole state.
+// MdParser is the parser's whole state: the document, read into its
+// events, and how far the walk has come.
 //
-// A value, so a caller can keep one and come back to it — which is
-// what a streaming consumer and a test that wants to replay a
-// document both need.
+// A value, so a caller can keep one and come back to it.
 pub struct MdParser
-    // The document being parsed.  Held so that `next` takes one
-    // argument, and so that a parser cannot be used against a
-    // different string by accident.
+    // The document.
     source: Str
     options: MdOptions
-    // The byte offset the block scanner has reached.
+    // The index of the next event `next` answers.
     at: Int
-    // How deep the open containers are, against `limits.max_nesting`.
+    // How many containers are open before that event.
     depth: Int
-    // True once a limit has been reached.  Read it with
-    // `parser_truncated` after the walk.
+    // True when a limit was reached.
     truncated: Bool
+    // Every event of the document, in order.
+    events: [MdEvent]
+    // The source range each event covers: a container's whole extent,
+    // opener and closer included, and a leaf's text.
+    spans: [MdRange]
+    // The label of every link reference definition, in document order.
+    definitions: [MdRange]
+    // The byte offset of every line.
+    lines: [Int]
 
 // MdStep is one event and the parser that follows it.
 pub struct MdStep
     parser: MdParser
     event: MdEvent
 
-// default_limits are bounds no real document reaches and no
-// adversarial one gets past: 64 levels of nesting, 4096 reference
-// definitions, 4096 open delimiters.
+// default_limits are bounds no real document reaches: 64 levels of
+// nesting, 4096 reference definitions, 4096 open delimiters.
+//
+// ```novo
+// use mdparse
+//
+// println(str.from_int(mdparse.default_limits().max_nesting))   // 64
+// ```
 pub fn default_limits() -> MdLimits []
-    todo("markdown-nv.mdparse.default_limits")
+    MdLimits { max_nesting: 64, max_reference_definitions: 4096, max_delimiters: 4096 }
 
 // commonmark_options is strict CommonMark: every extension off,
-// including tables.
+// including tables.  The configuration the specification's examples are
+// run under.
 //
-// The configuration the spec's own test suite is run under, and the
-// one to use when the output has to be comparable with another
-// implementation.
+// ```novo
+// use mdparse
+//
+// println(if mdparse.commonmark_options().tables then "tables" else "no tables")
+// ```
 pub fn commonmark_options() -> MdOptions []
-    todo("markdown-nv.mdparse.commonmark_options")
+    MdOptions { tables: false, strikethrough: false, task_lists: false, footnotes: false,
+                autolinks: false, heading_anchors: false, smart_punctuation: false,
+                limits: default_limits() }
 
 // default_options is CommonMark plus tables plus heading anchors.
 //
-// What the row on the plan asked for, and what the documentation this
-// package renders is written in.
+// ```novo
+// use mdparse
+//
+// println(if mdparse.default_options().tables then "tables" else "no tables")   // tables
+// ```
 pub fn default_options() -> MdOptions []
-    todo("markdown-nv.mdparse.default_options")
+    MdOptions { tables: true, strikethrough: false, task_lists: false, footnotes: false,
+                autolinks: false, heading_anchors: true, smart_punctuation: false,
+                limits: default_limits() }
 
-// gfm_options is every GitHub Flavored Markdown extension on.
+// gfm_options is every GitHub Flavored Markdown extension on: tables,
+// strikethrough, task lists, footnotes and extended autolinks.
+//
+// ```novo
+// use mdparse
+//
+// println(if mdparse.gfm_options().task_lists then "tasks" else "no tasks")   // tasks
+// ```
 pub fn gfm_options() -> MdOptions []
-    todo("markdown-nv.mdparse.gfm_options")
+    MdOptions { tables: true, strikethrough: true, task_lists: true, footnotes: true,
+                autolinks: true, heading_anchors: false, smart_punctuation: false,
+                limits: default_limits() }
 
-// parser starts a walk over a document with the default options.
+// parser reads a document with the default options and starts a walk
+// over its events.
 //
 // ```novo
 // use mdparse
@@ -262,100 +272,539 @@ pub fn gfm_options() -> MdOptions []
 //                 p = step.parser
 // ```
 pub fn parser(source: Str) -> MdParser []
-    todo("markdown-nv.mdparse.parser")
+    parser_with(source, default_options())
 
-// parser_with starts a walk with options of the caller's choosing.
+// parser_with reads a document with options of the caller's choosing.
+//
+// ```novo
+// use mdparse
+//
+// let p = mdparse.parser_with("~~gone~~\n", mdparse.gfm_options())
+// println(str.from_int(list.len(p.events)))
+// ```
 pub fn parser_with(source: Str, options: MdOptions) -> MdParser []
-    todo("markdown-nv.mdparse.parser_with")
+    let bo = BlockOpts { tables: options.tables, footnotes: options.footnotes,
+                         max_nesting: options.limits.max_nesting,
+                         max_refs: options.limits.max_reference_definitions }
+    let st = mdblock.parse(source, bo)
+    var em = Emitter { source: source, options: options, blocks: st, events: [], spans: [],
+                       truncated: st.truncated }
+    emit_block(em, 0)
+    var defs: [MdRange] = []
+    for r in st.ref_label
+        list.push(defs, MdRange { start: r.0, end: r.1 })
+    var lines: [Int] = []
+    for l in mdscan.line_table(source)
+        list.push(lines, l.0)
+    MdParser { source: source, options: options, at: 0, depth: 0, truncated: em.truncated,
+               events: em.events[:], spans: em.spans[:], definitions: defs, lines: lines }
 
 // next is the next event, or `None` at the end of the document.
 //
-// **The load-bearing interface.**  One event at a time, over a source
-// the caller holds, with the parser returned rather than mutated — so
-// a caller can look at an event and decide not to consume it, which is
-// what a renderer needs when it has to look one event ahead to decide
-// whether a list is tight.
+// The parser comes back in the step rather than being changed, so a
+// caller can look at an event and decide not to consume it.
+//
+// ```novo
+// use mdparse
+//
+// match mdparse.next(mdparse.parser("a\n"))
+//     Some(step) => println(if step.event == MdStart(TagParagraph) then "paragraph" else "other")
+//     None       => println("empty")
+// ```
 pub fn next(p: MdParser) -> ?MdStep []
-    todo("markdown-nv.mdparse.next")
+    if p.at >= list.len(p.events)
+        return None
+    let ev = p.events[p.at]
+    var depth = p.depth
+    match ev
+        MdStart(_) =>
+            depth = depth + 1
+        MdEnd(_)   =>
+            depth = depth - 1
+        _          =>
+            pass
+    Some(MdStep { parser: MdParser { source: p.source, options: p.options, at: p.at + 1,
+                                     depth: depth, truncated: p.truncated, events: p.events,
+                                     spans: p.spans, definitions: p.definitions,
+                                     lines: p.lines },
+                  event: ev })
 
 // parser_truncated answers whether a limit was reached.
 //
-// CommonMark has no parse errors, so this is the only thing a parser
-// can tell a caller that went wrong — and something did go wrong, in
-// the sense that the output does not match what the document said.
-// Ask it after the walk; a caller that never asks gets a rendering
-// with the deep parts as literal text, which is the safe failure.
+// CommonMark has no parse errors, so this is the one thing a parser can
+// report: that part of the output is literal text where the document
+// asked for structure.
+//
+// ```novo
+// use mdparse
+//
+// println(if mdparse.parser_truncated(mdparse.parser("a\n")) then "cut" else "whole")   // whole
+// ```
 pub fn parser_truncated(p: MdParser) -> Bool []
-    todo("markdown-nv.mdparse.parser_truncated")
+    p.truncated
 
 // slice is the text a range names.
 //
-// The one function a caller needs to turn an event into text, here
-// rather than left to `str.slice` at every call site because a range
-// is meaningless without the source it came from and this is the
-// function that pairs them.
+// ```novo
+// use mdparse
+//
+// let p = mdparse.parser("hello\n")
+// println(mdparse.slice(p, MdRange { start: 0, end: 5 }))   // hello
+// ```
 pub fn slice(p: MdParser, r: MdRange) -> Str []
-    todo("markdown-nv.mdparse.slice")
+    str.slice(p.source, r.start, r.end)
 
 // line_of is the 1-based line number a byte offset falls on.
 //
-// For a link checker or a linter reporting where something is.  Linear
-// in the offset, so a caller reporting many positions should collect
-// them and ask once — `line_starts` is that function.
+// ```novo
+// use mdparse
+//
+// println(str.from_int(mdparse.line_of(mdparse.parser("a\nb\n"), 2)))   // 2
+// ```
 pub fn line_of(p: MdParser, offset: Int) -> Int []
-    todo("markdown-nv.mdparse.line_of")
+    var lo = 0
+    var hi = list.len(p.lines) - 1
+    if hi < 0
+        return 1
+    for _ in 0..64
+        if lo >= hi
+            break
+        let mid = (lo + hi + 1) / 2
+        if p.lines[mid] <= offset
+            lo = mid
+        else
+            hi = mid - 1
+    lo + 1
 
 // line_starts is the byte offset of every line in the document.
 //
-// Built once, then binary-searched: the shape a tool reporting a
-// hundred positions wants, where `line_of` would be quadratic.
+// ```novo
+// use mdparse
+//
+// println(str.from_int(list.len(mdparse.line_starts(mdparse.parser("a\nb\n")))))   // 2
+// ```
 pub fn line_starts(p: MdParser) -> [Int] []
-    todo("markdown-nv.mdparse.line_starts")
+    p.lines[:]
 
-// reference_definitions is every link reference definition the
-// document declared, as label-and-destination pairs.
+// reference_definitions is the label of every link reference definition
+// the document declared, in document order.  The first definition of a
+// label is the one links use (section 4.7).
 //
-// Available before the walk finishes, because CommonMark resolves a
-// reference to a definition ANYWHERE in the document — including one
-// that comes later — so the parser has to scan for them first anyway.
-// A link checker wants the list; a renderer does not.
+// ```novo
+// use mdparse
+//
+// let p = mdparse.parser("[a]: /x\n")
+// println(str.from_int(list.len(mdparse.reference_definitions(p))))   // 1
+// ```
 pub fn reference_definitions(p: MdParser) -> [MdRange] []
-    todo("markdown-nv.mdparse.reference_definitions")
+    p.definitions[:]
 
-// ── The three places CommonMark is defined in terms of Unicode ───────
+// is_unicode_whitespace is CommonMark's "Unicode whitespace character"
+// (section 2.1): the Zs category, or a tab, line feed, form feed or
+// carriage return.  It decides, with the next function, whether a `*`
+// opens emphasis, closes it, or is literal.
 //
-// They are published rather than kept private because they are the
-// whole of why this package depends on unicode-nv, and because a
-// consumer comparing this parser with another one needs to be able to
-// ask the same questions this parser asked.
-
-// is_unicode_whitespace is CommonMark's "Unicode whitespace
-// character": `uclass.is_whitespace`, and nothing else.
+// ```novo
+// use mdparse
 //
-// It appears in the left- and right-flanking definitions, which decide
-// whether a `*` opens emphasis, closes it, or is literal.  A parser
-// that used ASCII whitespace here renders `*a*` and a non-breaking
-// space differently from every conforming implementation.
+// println(if mdparse.is_unicode_whitespace(0x00A0) then "space" else "not")   // space
+// ```
 pub fn is_unicode_whitespace(ch: Int) -> Bool []
-    todo("markdown-nv.mdparse.is_unicode_whitespace")
+    mdscan.unicode_whitespace(ch)
 
 // is_unicode_punctuation is CommonMark's "Unicode punctuation
-// character": the P categories AND the S categories, which is
-// `uclass.is_punctuation(ch) or uclass.is_symbol(ch)`.
+// character" (section 2.1): the P categories and the S categories.
 //
-// The "and the S categories" half is the part implementations get
-// wrong — it was added in CommonMark 0.30 — and it is why this package
-// calls two of unicode-nv's predicates rather than one.
+// ```novo
+// use mdparse
+//
+// println(if mdparse.is_unicode_punctuation(0x002B) then "punctuation" else "not")
+// ```
 pub fn is_unicode_punctuation(ch: Int) -> Bool []
-    todo("markdown-nv.mdparse.is_unicode_punctuation")
+    mdscan.unicode_punctuation(ch)
 
-// reference_label_key is the matching key for a link reference label.
+// reference_label_key is the key a link reference label is matched by
+// (section 4.7): leading and trailing whitespace off, each inner run of
+// whitespace one space, and Unicode case folding, so `[STRASSE]` finds
+// `[straße]: /url`.
 //
-// CommonMark § 4.7 matches labels after stripping, collapsing internal
-// whitespace, and **Unicode case folding** — so `[FOO]` finds
-// `[foo]: /url` and `[STRASSE]` finds `[straße]: /url`.  That last one
-// is `ucase.fold`, and it is the second reason this package depends on
-// unicode-nv: `str.lower` gets it wrong on exactly the input the spec
-// singles out.
+// ```novo
+// use mdparse
+//
+// let p = mdparse.parser("[Foo  Bar]: /url\n")
+// println(mdparse.reference_label_key(p, MdRange { start: 1, end: 9 }))   // foo bar
+// ```
 pub fn reference_label_key(p: MdParser, label: MdRange) -> Str []
-    todo("markdown-nv.mdparse.reference_label_key")
+    mdscan.label_key(slice(p, label))
+
+// ── From blocks to events ─────────────────────────────────────────────
+
+// The events being written, and the spans beside them.
+struct Emitter
+    source: Str
+    options: MdOptions
+    blocks: mdblock.Blocks
+    var events: [MdEvent]
+    var spans: [MdRange]
+    var truncated: Bool
+
+fn push(var em: Emitter, ev: MdEvent, a: Int, e: Int)
+    list.push(em.events, ev)
+    list.push(em.spans, MdRange { start: a, end: e })
+
+// A text run, joined onto the text before it when the two touch.
+fn push_text(var em: Emitter, a: Int, e: Int)
+    let n = list.len(em.events)
+    if n > 0
+        match em.events[n - 1]
+            MdText(r) =>
+                if r.end == a
+                    em.events[n - 1] = MdText(MdRange { start: r.start, end: e })
+                    em.spans[n - 1] = MdRange { start: r.start, end: e }
+                    return
+            _         =>
+                pass
+    push(em, MdText(MdRange { start: a, end: e }), a, e)
+
+fn range(a: Int, e: Int) -> MdRange
+    MdRange { start: a, end: e }
+
+fn block_tag(em: Emitter, id: Int) -> MdTag
+    let st = em.blocks
+    let k = st.kind[id]
+    if k == mdblock.k_quote()
+        return TagBlockQuote
+    if k == mdblock.k_list()
+        let kind = if st.a[id] != 0
+            ListBullet(st.a[id])
+        else
+            ListOrdered(st.b[id], st.c[id])
+        return TagList(kind, st.d[id] == 0)
+    if k == mdblock.k_item()
+        return TagItem
+    TagFootnoteDefinition(range(st.r0[id], st.r1[id]))
+
+// Emit block `id` and everything in it.  The recursion follows the
+// block nesting, which `MdLimits.max_nesting` bounds.
+fn emit_block(var em: Emitter, id: Int)
+    let st = em.blocks
+    let k = st.kind[id]
+    let a = st.start[id]
+    let e = st.stop[id]
+    if k == mdblock.k_doc()
+        emit_children(em, id)
+    elif k == mdblock.k_para()
+        push(em, MdStart(TagParagraph), a, e)
+        emit_paragraph(em, id)
+        push(em, MdEnd(TagParagraph), a, e)
+    elif k == mdblock.k_heading()
+        emit_heading(em, id)
+    elif k == mdblock.k_fenced() or k == mdblock.k_indented()
+        let info = range(st.r0[id], st.r1[id])
+        let tag = if k == mdblock.k_fenced()
+            TagCodeBlock(CodeFenced(info))
+        else
+            TagCodeBlock(CodeIndented)
+        push(em, MdStart(tag), a, e)
+        for ln in st.l0[id]..st.l1[id]
+            emit_line(em, ln, true)
+        push(em, MdEnd(tag), a, e)
+    elif k == mdblock.k_html()
+        for ln in st.l0[id]..st.l1[id]
+            emit_line(em, ln, false)
+    elif k == mdblock.k_rule()
+        push(em, MdRule, a, e)
+    elif k == mdblock.k_table()
+        emit_table(em, id)
+    else
+        let tag = block_tag(em, id)
+        push(em, MdStart(tag), a, e)
+        emit_children(em, id)
+        push(em, MdEnd(tag), a, e)
+
+fn emit_children(var em: Emitter, id: Int)
+    var c = em.blocks.first[id]
+    for _ in 0..list.len(em.blocks.kind)
+        if c < 0
+            break
+        emit_block(em, c)
+        c = em.blocks.next[c]
+
+// One line of a code block or an HTML block: the spaces a partly
+// consumed tab stands for, the text, and its line ending as a line feed.
+fn emit_line(var em: Emitter, ln: Int, code: Bool)
+    let st = em.blocks
+    for _ in 0..st.ln_pad[ln]
+        push(em, MdChar(' '), st.ln_start[ln], st.ln_start[ln])
+    let s = st.ln_start[ln]
+    let e = st.ln_end[ln]
+    let lf = st.ln_join[ln] == 1 and str.byte_at_or(em.source, e, 0) == '\n'
+    let end = if lf
+        e + 1
+    else
+        e
+    if end > s
+        let ev = if code
+            MdCode(range(s, end))
+        else
+            MdHtml(range(s, end))
+        push(em, ev, s, end)
+    if code and not lf
+        push(em, MdChar('\n'), e, e)
+
+// The lines of leaf `id` as joined text, from `from` in the first line
+// and to `to` in the last, or to each line's end when `to` is -1.
+fn leaf_text(em: Emitter, id: Int, from: Int, to: Int) -> mdscan.Segs
+    let st = em.blocks
+    var starts: [Int] = []
+    var ends: [Int] = []
+    var joins: [Int] = []
+    for k in st.l0[id]..st.l1[id]
+        var s = st.ln_start[k]
+        if k == st.l0[id] and from >= 0
+            s = from
+        var e = st.ln_end[k]
+        if k == st.l1[id] - 1 and to >= 0
+            e = to
+        list.push(starts, s)
+        list.push(ends, e)
+        list.push(joins, (if st.ln_join[k] > 0 then st.ln_join[k] else 1))
+    mdscan.segs(em.source, starts, ends, joins)
+
+fn inline_opts(em: Emitter) -> InlineOpts
+    InlineOpts { strikethrough: em.options.strikethrough, footnotes: em.options.footnotes,
+                 autolinks: em.options.autolinks, smart: em.options.smart_punctuation,
+                 max_delims: em.options.limits.max_delimiters }
+
+fn emit_paragraph(var em: Emitter, id: Int)
+    let st = em.blocks
+    var from = if st.cut[id] >= 0
+        st.cut[id]
+    else
+        st.ln_start[st.l0[id]]
+    if em.options.task_lists and st.prev[id] < 0 and st.parent[id] >= 0
+            and st.kind[st.parent[id]] == mdblock.k_item()
+        let t = task_marker(em.source, from, st.ln_end[st.l0[id]])
+        if t > 0
+            push(em, MdTaskMarker(t == 2), from, from + 3)
+            from = from + 3
+    emit_inline(em, leaf_text(em, id, from, -1))
+
+// A task list marker `[ ]`, `[x]` or `[X]` at `a`, followed by a space
+// or the end of the line: 1 unchecked, 2 checked, or 0.
+fn task_marker(s: Str, a: Int, e: Int) -> Int
+    if mdscan.at(s, a, e) != '[' or mdscan.at(s, a + 2, e) != ']'
+        return 0
+    let after = mdscan.at(s, a + 3, e)
+    if not (after < 0 or mdscan.is_space_or_tab(after))
+        return 0
+    let m = mdscan.at(s, a + 1, e)
+    if m == ' '
+        return 1
+    if m == 'x' or m == 'X'
+        return 2
+    0
+
+fn emit_heading(var em: Emitter, id: Int)
+    let st = em.blocks
+    let setext = st.b[id] == 1
+    var cs = st.r0[id]
+    var ce = st.r1[id]
+    if setext
+        cs = if st.cut[id] >= 0
+            st.cut[id]
+        else
+            st.ln_start[st.l0[id]]
+        ce = st.ln_end[st.l1[id] - 1]
+    var anchor = range(0, 0)
+    var text_end = ce
+    if em.options.heading_anchors
+        let found = anchor_at(em.source, cs, ce)
+        if found.0 >= 0
+            anchor = range(found.0, found.1)
+            text_end = found.2
+    let tag = TagHeading(st.a[id], anchor)
+    push(em, MdStart(tag), st.start[id], st.stop[id])
+    if setext
+        emit_inline(em, leaf_text(em, id, cs, text_end))
+    else
+        emit_inline(em, mdscan.segs(em.source, [cs], [text_end], [0]))
+    push(em, MdEnd(tag), st.start[id], st.stop[id])
+
+// A `{#id}` at the end of a heading's content `[a, e)`, as `(id start,
+// id end, where the heading text now ends)`, or a start of -1.  It must
+// follow a space, and the id holds no space.
+fn anchor_at(s: Str, a: Int, e: Int) -> (Int, Int, Int)
+    var z = e
+    for _ in a..e
+        if not mdscan.is_space_or_tab(mdscan.at(s, z - 1, e))
+            break
+        z = z - 1
+    if mdscan.at(s, z - 1, e) != '}'
+        return (-1, 0, 0)
+    var k = z - 2
+    for _ in a..z
+        if k < a
+            return (-1, 0, 0)
+        let b = mdscan.at(s, k, e)
+        if b == '{'
+            break
+        if mdscan.is_ascii_space(b) or b == '}'
+            return (-1, 0, 0)
+        k = k - 1
+    if mdscan.at(s, k + 1, e) != '#' or k + 2 >= z - 1
+        return (-1, 0, 0)
+    if k > a and not mdscan.is_space_or_tab(mdscan.at(s, k - 1, e))
+        return (-1, 0, 0)
+    var t = k
+    for _ in a..k
+        if not mdscan.is_space_or_tab(mdscan.at(s, t - 1, e))
+            break
+        t = t - 1
+    (k + 2, z - 1, t)
+
+fn align_of(v: Int) -> MdAlign
+    if v == 1
+        AlignLeft
+    elif v == 2
+        AlignCentre
+    elif v == 3
+        AlignRight
+    else
+        AlignNone
+
+fn emit_table(var em: Emitter, id: Int)
+    let st = em.blocks
+    var aligns: [MdAlign] = []
+    for v in st.aligns[st.c[id]]
+        list.push(aligns, align_of(v))
+    let tag = TagTable(aligns)
+    let a = st.start[id]
+    let e = st.stop[id]
+    let columns = list.len(aligns)
+    push(em, MdStart(tag), a, e)
+    for ln in st.l0[id]..st.l1[id]
+        let head = ln == st.l0[id]
+        let ls = if head and st.start[id] > st.ln_start[ln]
+            st.start[id]
+        else
+            st.ln_start[ln]
+        let row_tag = if head
+            TagTableHead
+        else
+            TagTableRow
+        let row_end = st.ln_end[ln] + st.ln_join[ln]
+        push(em, MdStart(row_tag), ls, row_end)
+        let cells = mdblock.row_cells(em.source, ls, st.ln_end[ln])
+        for c in 0..columns
+            if c < list.len(cells)
+                let cell = cells[c]
+                push(em, MdStart(TagTableCell), cell.0, cell.1)
+                emit_inline(em, cell_text(em.source, cell.0, cell.1))
+                push(em, MdEnd(TagTableCell), cell.0, cell.1)
+            else
+                push(em, MdStart(TagTableCell), st.ln_end[ln], st.ln_end[ln])
+                push(em, MdEnd(TagTableCell), st.ln_end[ln], st.ln_end[ln])
+        push(em, MdEnd(row_tag), ls, row_end)
+    push(em, MdEnd(tag), a, e)
+
+// A table cell's text with the backslash of every `\|` left out, since
+// the pipe is the cell's own text even inside a code span.
+fn cell_text(s: Str, a: Int, e: Int) -> mdscan.Segs
+    var starts: [Int] = []
+    var ends: [Int] = []
+    var joins: [Int] = []
+    var from = a
+    for k in a..e
+        if str.byte_at_or(s, k, 0) == '\\' and str.byte_at_or(s, k + 1, 0) == '|'
+            list.push(starts, from)
+            list.push(ends, k)
+            list.push(joins, 0)
+            from = k + 1
+    list.push(starts, from)
+    list.push(ends, e)
+    list.push(joins, 0)
+    mdscan.segs(s, starts, ends, joins)
+
+// ── From inline nodes to events ───────────────────────────────────────
+
+fn emit_inline(var em: Emitter, g: mdscan.Segs)
+    let p = mdinline.parse(g, em.blocks, inline_opts(em))
+    if p.truncated
+        em.truncated = true
+    // A walk with an explicit stack: nested emphasis can be as deep as
+    // the delimiter bound allows.
+    var stack: [Int] = []
+    var entered: [Bool] = []
+    var c = p.first[0]
+    if c >= 0
+        list.push(stack, c)
+        list.push(entered, false)
+    for _ in 0..list.len(p.kind) * 2 + 2
+        let n = list.len(stack)
+        if n == 0
+            break
+        let id = stack[n - 1]
+        let is_container = p.first[id] >= 0 or p.kind[id] == mdinline.i_emph()
+                           or p.kind[id] == mdinline.i_strong()
+                           or p.kind[id] == mdinline.i_strike()
+                           or p.kind[id] == mdinline.i_link()
+                           or p.kind[id] == mdinline.i_image()
+        if not entered[n - 1] and is_container
+            entered[n - 1] = true
+            push(em, MdStart(inline_tag(p, id)), mdscan.to_source(g, p.s[id]),
+                 mdscan.to_source(g, p.e[id]))
+            let child = p.first[id]
+            if child >= 0
+                list.push(stack, child)
+                list.push(entered, false)
+            continue
+        if is_container
+            push(em, MdEnd(inline_tag(p, id)), mdscan.to_source(g, p.s[id]),
+                 mdscan.to_source(g, p.e[id]))
+        else
+            emit_leaf(em, p, g, id)
+        stack = stack[0:n - 1]
+        entered = entered[0:n - 1]
+        let nx = p.next[id]
+        if nx >= 0
+            list.push(stack, nx)
+            list.push(entered, false)
+
+fn inline_tag(p: mdinline.Inl, id: Int) -> MdTag
+    let k = p.kind[id]
+    if k == mdinline.i_emph()
+        return TagEmphasis
+    if k == mdinline.i_strong()
+        return TagStrong
+    if k == mdinline.i_strike()
+        return TagStrikethrough
+    let link = MdLink { destination: range(p.dest0[id], p.dest1[id]),
+                        title: range(p.title0[id], p.title1[id]),
+                        from_reference: p.from_ref[id], prefix: p.prefix[id],
+                        autolink: p.auto[id] }
+    if k == mdinline.i_image()
+        return TagImage(link)
+    TagLink(link)
+
+fn emit_leaf(var em: Emitter, p: mdinline.Inl, g: mdscan.Segs, id: Int)
+    let k = p.kind[id]
+    let a = mdscan.to_source(g, p.s[id])
+    let e = mdscan.to_source(g, p.e[id])
+    if k == mdinline.i_text()
+        for piece in mdscan.source_pieces(g, p.s[id], p.e[id])
+            push_text(em, piece.0, piece.1)
+    elif k == mdinline.i_char()
+        push(em, MdChar(p.ch[id]), a, e)
+    elif k == mdinline.i_code()
+        for piece in mdscan.source_pieces(g, p.s[id], p.e[id])
+            push(em, MdCode(range(piece.0, piece.1)), piece.0, piece.1)
+    elif k == mdinline.i_html()
+        for piece in mdscan.source_pieces(g, p.s[id], p.e[id])
+            push(em, MdHtml(range(piece.0, piece.1)), piece.0, piece.1)
+    elif k == mdinline.i_soft()
+        push(em, MdSoftBreak, a, e)
+    elif k == mdinline.i_hard()
+        push(em, MdHardBreak, a, e)
+    else
+        push(em, MdFootnoteRef(range(p.dest0[id], p.dest1[id])), a, e)

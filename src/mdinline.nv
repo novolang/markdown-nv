@@ -1,0 +1,946 @@
+// mdinline.nv — the inline content of one leaf block (CommonMark
+// section 6): code spans, emphasis, links, images, autolinks, raw HTML,
+// character references and line breaks.
+//
+// The parser reads the leaf's joined text once, left to right, and
+// builds a list of inline nodes.  A run of `*`, `_` or `~` becomes a
+// text node and a delimiter; a `[` or `![` becomes a text node and a
+// bracket.  A `]` looks back for its bracket and, when a link follows,
+// moves the nodes after the bracket into a link node.  Emphasis is
+// resolved as the specification's appendix on inline structure
+// describes, pairing closers with openers from the inside out.
+//
+// The nodes live in an arena of parallel lists linked by index, like
+// the block arena, so moving a run of nodes into a new parent is a few
+// index writes.
+
+use std.str
+use std.list
+use mdscan
+use mdblock
+
+// The inline node kinds.
+fn i_root() -> Int
+    0
+
+fn i_text() -> Int
+    1
+
+fn i_char() -> Int
+    2
+
+fn i_code() -> Int
+    3
+
+fn i_html() -> Int
+    4
+
+fn i_soft() -> Int
+    5
+
+fn i_hard() -> Int
+    6
+
+fn i_emph() -> Int
+    7
+
+fn i_strong() -> Int
+    8
+
+fn i_strike() -> Int
+    9
+
+fn i_link() -> Int
+    10
+
+fn i_image() -> Int
+    11
+
+fn i_footref() -> Int
+    12
+
+// What the inline parser needs from the options.
+struct InlineOpts
+    strikethrough: Bool
+    footnotes: Bool
+    autolinks: Bool
+    smart: Bool
+    max_delims: Int
+
+// The arena, the delimiter list and the bracket stack.
+//
+// `s` and `e` are positions in the joined text: the text of a text,
+// code or HTML node, and the whole extent of a container, markers
+// included.  A link keeps its destination and title as source ranges,
+// and `prefix` is what goes before the destination: `mailto:` for an
+// email autolink, `http://` for a `www.` one.
+struct Inl
+    g: mdscan.Segs
+    text: Str
+    n: Int
+    opts: InlineOpts
+    var kind: [Int]
+    var s: [Int]
+    var e: [Int]
+    var ch: [Int]
+    var parent: [Int]
+    var first: [Int]
+    var last: [Int]
+    var next: [Int]
+    var prev: [Int]
+    var dest0: [Int]
+    var dest1: [Int]
+    var title0: [Int]
+    var title1: [Int]
+    var from_ref: [Bool]
+    var prefix: [Str]
+    var auto: [Bool]
+    var d_node: [Int]
+    var d_char: [Int]
+    var d_num: [Int]
+    var d_orig: [Int]
+    var d_open: [Bool]
+    var d_close: [Bool]
+    var d_prev: [Int]
+    var d_next: [Int]
+    var d_top: Int
+    var d_live: Int
+    var b_node: [Int]
+    var b_image: [Bool]
+    var b_active: [Bool]
+    var b_after: [Bool]
+    var b_delim: [Int]
+    var b_pos: [Int]
+    var b_count: Int
+    var truncated: Bool
+    // The extended autolinks, when the option is on.
+    cands: HashMap<Int, (Int, Int)>
+
+fn new_node(var p: Inl, kind: Int, s: Int, e: Int) -> Int
+    let id = list.len(p.kind)
+    list.push(p.kind, kind)
+    list.push(p.s, s)
+    list.push(p.e, e)
+    list.push(p.ch, 0)
+    list.push(p.parent, -1)
+    list.push(p.first, -1)
+    list.push(p.last, -1)
+    list.push(p.next, -1)
+    list.push(p.prev, -1)
+    list.push(p.dest0, 0)
+    list.push(p.dest1, 0)
+    list.push(p.title0, 0)
+    list.push(p.title1, 0)
+    list.push(p.from_ref, false)
+    list.push(p.prefix, "")
+    list.push(p.auto, false)
+    id
+
+fn append(var p: Inl, parent: Int, id: Int)
+    p.parent[id] = parent
+    let lc = p.last[parent]
+    p.prev[id] = lc
+    p.next[id] = -1
+    if lc >= 0
+        p.next[lc] = id
+    else
+        p.first[parent] = id
+    p.last[parent] = id
+
+fn detach(var p: Inl, id: Int)
+    let parent = p.parent[id]
+    let pv = p.prev[id]
+    let nx = p.next[id]
+    if pv >= 0
+        p.next[pv] = nx
+    elif parent >= 0
+        p.first[parent] = nx
+    if nx >= 0
+        p.prev[nx] = pv
+    elif parent >= 0
+        p.last[parent] = pv
+    p.parent[id] = -1
+    p.prev[id] = -1
+    p.next[id] = -1
+
+// Insert `id` after `after` among its siblings.
+fn insert_after(var p: Inl, after: Int, id: Int)
+    let parent = p.parent[after]
+    let nx = p.next[after]
+    p.parent[id] = parent
+    p.prev[id] = after
+    p.next[id] = nx
+    p.next[after] = id
+    if nx >= 0
+        p.prev[nx] = id
+    else
+        p.last[parent] = id
+
+// Move every sibling after `from` up to, and not including, `until`
+// into `into`.  `until` of -1 moves them all.
+fn move_between(var p: Inl, from: Int, until: Int, into: Int)
+    var cur = p.next[from]
+    for _ in 0..list.len(p.kind)
+        if cur < 0 or cur == until
+            break
+        let nx = p.next[cur]
+        detach(p, cur)
+        append(p, into, cur)
+        cur = nx
+
+fn add(var p: Inl, kind: Int, s: Int, e: Int) -> Int
+    let id = new_node(p, kind, s, e)
+    append(p, 0, id)
+    id
+
+fn add_char(var p: Inl, cp: Int, s: Int, e: Int)
+    let id = add(p, i_char(), s, e)
+    p.ch[id] = cp
+
+fn peek(p: Inl, i: Int) -> Int
+    mdscan.at(p.text, i, p.n)
+
+// Parse the joined text of one leaf.
+fn parse(g: mdscan.Segs, blocks: mdblock.Blocks, o: InlineOpts) -> Inl
+    let n = rtrimmed_len(g.text)
+    var cands: HashMap<Int, (Int, Int)> = HashMap.new()
+    if o.autolinks
+        cands = autolink_candidates(g.text, n)
+    var p = Inl { g: g, text: g.text, n: n, opts: o, kind: [], s: [], e: [],
+                  ch: [], parent: [], first: [], last: [], next: [], prev: [], dest0: [],
+                  dest1: [], title0: [], title1: [], from_ref: [], prefix: [], auto: [], d_node: [],
+                  d_char: [], d_num: [], d_orig: [], d_open: [], d_close: [], d_prev: [],
+                  d_next: [], d_top: -1, d_live: 0, b_node: [], b_image: [], b_active: [],
+                  b_after: [], b_delim: [], b_pos: [], b_count: 0, truncated: false,
+                  cands: cands }
+    new_node(p, i_root(), 0, p.n)
+    var pos = 0
+    for _ in 0..p.n + 1
+        if pos >= p.n
+            break
+        pos = step(p, blocks, pos)
+    process_emphasis(p, -1)
+    p
+
+// The length of `t` without its trailing spaces, tabs and line endings.
+fn rtrimmed_len(t: Str) -> Int
+    var n = str.len(t)
+    for _ in 0..str.len(t) + 1
+        if n <= 0
+            break
+        let b = str.byte_at_or(t, n - 1, 0)
+        if not (b == ' ' or b == '\t' or b == '\n' or b == '\r')
+            break
+        n = n - 1
+    n
+
+// Read one construct at `pos` and answer the position after it.
+fn step(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
+    if p.opts.autolinks and p.cands.has(pos)
+        return extended(p, pos)
+    let c = peek(p, pos)
+    if c == '\n'
+        return newline(p, pos)
+    if c == '`'
+        return code_span(p, pos)
+    if c == '\\'
+        return backslash(p, pos)
+    if c == '&'
+        return entity(p, pos)
+    if c == '<'
+        return angle(p, pos)
+    if c == '*' or c == '_' or c == '~' and p.opts.strikethrough
+        return delimiters(p, pos, c)
+    if c == '['
+        if p.opts.footnotes and peek(p, pos + 1) == '^'
+            let f = footnote_ref(p, blocks, pos)
+            if f > pos
+                return f
+        let id = add(p, i_text(), pos, pos + 1)
+        push_bracket(p, id, false, pos + 1)
+        return pos + 1
+    if c == '!'
+        if peek(p, pos + 1) == '['
+            let id = add(p, i_text(), pos, pos + 2)
+            push_bracket(p, id, true, pos + 2)
+            return pos + 2
+        add(p, i_text(), pos, pos + 1)
+        return pos + 1
+    if c == ']'
+        return close_bracket(p, blocks, pos)
+    if p.opts.smart and (c == '"' or c == '\'' or c == '.' or c == '-')
+        return smart(p, pos, c)
+    text_run(p, pos)
+
+fn special(p: Inl, b: Int) -> Bool
+    if b == '\n' or b == '`' or b == '\\' or b == '&' or b == '<' or b == '*' or b == '_'
+            or b == '[' or b == ']' or b == '!'
+        return true
+    if b == '~' and p.opts.strikethrough
+        return true
+    p.opts.smart and (b == '"' or b == '\'' or b == '.' or b == '-')
+
+// Plain text up to the next character that could start a construct.
+// Spaces before a line ending are left out, since they belong to the
+// break.
+fn text_run(var p: Inl, pos: Int) -> Int
+    var k = pos + 1
+    for _ in k..p.n
+        if k >= p.n or special(p, peek(p, k)) or p.opts.autolinks and p.cands.has(k)
+            break
+        k = k + 1
+    var e = k
+    if k >= p.n or peek(p, k) == '\n'
+        for _ in pos..k
+            let b = peek(p, e - 1)
+            if e <= pos or not (b == ' ' or b == '\t')
+                break
+            e = e - 1
+    if e > pos
+        add(p, i_text(), pos, e)
+    k
+
+// A line ending: a hard break when two spaces come before it, a soft
+// one otherwise (section 6.7).  The next line's leading spaces were
+// left out when the block kept its lines.
+fn newline(var p: Inl, pos: Int) -> Int
+    let hard = pos >= 2 and peek(p, pos - 1) == ' ' and peek(p, pos - 2) == ' '
+    add(p, (if hard then i_hard() else i_soft()), pos, pos + 1)
+    pos + 1
+
+// A backslash escape (section 2.4), or a hard break before a line
+// ending.
+fn backslash(var p: Inl, pos: Int) -> Int
+    let b = peek(p, pos + 1)
+    if b == '\n'
+        add(p, i_hard(), pos, pos + 2)
+        return pos + 2
+    if mdscan.is_ascii_punct(b)
+        add_char(p, b, pos, pos + 2)
+        return pos + 2
+    add(p, i_text(), pos, pos + 1)
+    pos + 1
+
+fn entity(var p: Inl, pos: Int) -> Int
+    let e = mdscan.entity(p.text, pos, p.n)
+    if list.len(e.0) == 0
+        add(p, i_text(), pos, pos + 1)
+        return pos + 1
+    for cp in e.0
+        add_char(p, cp, pos, e.1)
+    e.1
+
+// A code span (section 6.1): a backtick run closed by a run of the
+// same length.  One space is taken off each end when both ends have
+// one and the content is not all spaces.
+fn code_span(var p: Inl, pos: Int) -> Int
+    var n = 0
+    for _ in pos..p.n
+        if peek(p, pos + n) != '`'
+            break
+        n = n + 1
+    let open_end = pos + n
+    var k = open_end
+    for _ in open_end..p.n + 1
+        if k >= p.n
+            break
+        if peek(p, k) != '`'
+            k = k + 1
+            continue
+        var m = 0
+        for _ in k..p.n
+            if peek(p, k + m) != '`'
+                break
+            m = m + 1
+        if m == n
+            var a = open_end
+            var z = k
+            let first = peek(p, a)
+            let last = peek(p, z - 1)
+            if z - a >= 2 and (first == ' ' or first == '\n') and (last == ' ' or last == '\n')
+                    and not all_spaces(p, a, z)
+                a = a + 1
+                z = z - 1
+            let id = add(p, i_code(), a, z)
+            p.s[id] = a
+            return k + m
+        k = k + m
+    add(p, i_text(), pos, open_end)
+    open_end
+
+fn all_spaces(p: Inl, a: Int, z: Int) -> Bool
+    for k in a..z
+        let b = peek(p, k)
+        if b != ' ' and b != '\n'
+            return false
+    true
+
+// `<`: an autolink, raw HTML, or a literal `<`.
+fn angle(var p: Inl, pos: Int) -> Int
+    let auto = mdscan.autolink(p.text, pos, p.n)
+    if auto.0 > 0
+        let id = add(p, i_link(), pos, auto.0)
+        p.dest0[id] = mdscan.to_source(p.g, pos + 1)
+        p.dest1[id] = mdscan.to_source(p.g, auto.0 - 1)
+        p.title0[id] = p.dest1[id]
+        p.title1[id] = p.dest1[id]
+        p.prefix[id] = if auto.1
+            "mailto:"
+        else
+            ""
+        p.auto[id] = true
+        let t = new_node(p, i_text(), pos + 1, auto.0 - 1)
+        append(p, id, t)
+        return auto.0
+    let html = mdscan.raw_html(p.text, pos, p.n)
+    if html > 0
+        add(p, i_html(), pos, html)
+        return html
+    add(p, i_text(), pos, pos + 1)
+    pos + 1
+
+// A run of `*`, `_` or `~` (section 6.2).  Whether it can open or close
+// emphasis depends on the characters on either side, read as Unicode.
+fn delimiters(var p: Inl, pos: Int, c: Int) -> Int
+    var n = 0
+    for _ in pos..p.n
+        if peek(p, pos + n) != c
+            break
+        n = n + 1
+    let id = add(p, i_text(), pos, pos + n)
+    if c == '~' and n > 2
+        return pos + n
+    let before = mdscan.decode_before(p.text, pos)
+    let after = if pos + n >= p.n
+        '\n'
+    else
+        mdscan.decode(p.text, pos + n, p.n).0
+    let ws_before = mdscan.unicode_whitespace(before)
+    let ws_after = mdscan.unicode_whitespace(after)
+    let punct_before = mdscan.unicode_punctuation(before)
+    let punct_after = mdscan.unicode_punctuation(after)
+    let left = not ws_after and (not punct_after or ws_before or punct_before)
+    let right = not ws_before and (not punct_before or ws_after or punct_after)
+    var can_open = left
+    var can_close = right
+    if c == '_'
+        can_open = left and (not right or punct_before)
+        can_close = right and (not left or punct_after)
+    if can_open or can_close
+        if p.d_live >= p.opts.max_delims
+            p.truncated = true
+        else
+            push_delim(p, id, c, n, can_open, can_close)
+    pos + n
+
+fn push_delim(var p: Inl, node: Int, c: Int, n: Int, can_open: Bool, can_close: Bool)
+    let id = list.len(p.d_node)
+    list.push(p.d_node, node)
+    list.push(p.d_char, c)
+    list.push(p.d_num, n)
+    list.push(p.d_orig, n)
+    list.push(p.d_open, can_open)
+    list.push(p.d_close, can_close)
+    list.push(p.d_prev, p.d_top)
+    list.push(p.d_next, -1)
+    if p.d_top >= 0
+        p.d_next[p.d_top] = id
+    p.d_top = id
+    p.d_live = p.d_live + 1
+
+fn remove_delim(var p: Inl, d: Int)
+    let pv = p.d_prev[d]
+    let nx = p.d_next[d]
+    if nx >= 0
+        p.d_prev[nx] = pv
+    else
+        p.d_top = pv
+    if pv >= 0
+        p.d_next[pv] = nx
+    p.d_live = p.d_live - 1
+
+// Pair closers with openers above `bottom` (the appendix, "process
+// emphasis").
+fn process_emphasis(var p: Inl, bottom: Int)
+    var floors: HashMap<Int, Int> = HashMap.new()
+    var closer = if bottom >= 0
+        p.d_next[bottom]
+    else
+        first_delim(p)
+    for _ in 0..list.len(p.d_node) * 4 + 4
+        if closer < 0
+            break
+        if not p.d_close[closer]
+            closer = p.d_next[closer]
+            continue
+        let c = p.d_char[closer]
+        let key = c * 8 + (if p.d_open[closer] then 3 else 0) + p.d_orig[closer] % 3
+        let floor = floors.get(key) ?? bottom
+        var opener = p.d_prev[closer]
+        var found = false
+        for _ in 0..list.len(p.d_node)
+            if opener < 0 or opener == bottom or opener == floor
+                break
+            if p.d_open[opener] and p.d_char[opener] == c and matches(p, opener, closer)
+                found = true
+                break
+            opener = p.d_prev[opener]
+        let old = closer
+        if found
+            closer = insert_emph(p, opener, closer)
+        else
+            floors.set(key, p.d_prev[old])
+            let nx = p.d_next[old]
+            if not p.d_open[old]
+                remove_delim(p, old)
+            closer = nx
+    for _ in 0..list.len(p.d_node)
+        if p.d_top < 0 or p.d_top == bottom
+            break
+        remove_delim(p, p.d_top)
+
+fn first_delim(p: Inl) -> Int
+    var d = p.d_top
+    for _ in 0..list.len(p.d_node)
+        if d < 0 or p.d_prev[d] < 0
+            break
+        d = p.d_prev[d]
+    d
+
+// The rule of multiples of three (section 6.2, rules 9 and 10), and a
+// strikethrough's closer must be as long as its opener.
+fn matches(p: Inl, opener: Int, closer: Int) -> Bool
+    if p.d_char[closer] == '~'
+        return p.d_num[opener] == p.d_num[closer]
+    if not (p.d_close[opener] or p.d_open[closer])
+        return true
+    p.d_orig[closer] % 3 == 0 and p.d_orig[opener] % 3 == 0
+        or (p.d_orig[opener] + p.d_orig[closer]) % 3 != 0
+
+// Wrap the nodes between an opener and a closer in emphasis, and
+// answer the next closer to look at.
+fn insert_emph(var p: Inl, opener: Int, closer: Int) -> Int
+    let c = p.d_char[closer]
+    var taken = if p.d_num[closer] >= 2 and p.d_num[opener] >= 2
+        2
+    else
+        1
+    if c == '~'
+        taken = p.d_num[closer]
+    let o_node = p.d_node[opener]
+    let c_node = p.d_node[closer]
+    p.d_num[opener] = p.d_num[opener] - taken
+    p.d_num[closer] = p.d_num[closer] - taken
+    p.e[o_node] = p.e[o_node] - taken
+    p.s[c_node] = p.s[c_node] + taken
+    let kind = if c == '~'
+        i_strike()
+    else if taken == 2
+        i_strong()
+    else
+        i_emph()
+    let emph = new_node(p, kind, p.e[o_node], p.s[c_node])
+    insert_after(p, o_node, emph)
+    move_between(p, emph, c_node, emph)
+    // The delimiters between the two are inside the emphasis now.
+    var d = p.d_prev[closer]
+    for _ in 0..list.len(p.d_node)
+        if d < 0 or d == opener
+            break
+        let pv = p.d_prev[d]
+        remove_delim(p, d)
+        d = pv
+    if p.d_num[opener] == 0
+        detach(p, o_node)
+        remove_delim(p, opener)
+    if p.d_num[closer] == 0
+        detach(p, c_node)
+        let nx = p.d_next[closer]
+        remove_delim(p, closer)
+        return nx
+    closer
+
+// ── Links and images (section 6.3 and 6.4) ────────────────────────────
+
+fn push_bracket(var p: Inl, node: Int, image: Bool, after: Int)
+    if p.b_count > 0
+        p.b_after[p.b_count - 1] = true
+    if p.b_count < list.len(p.b_node)
+        p.b_node[p.b_count] = node
+        p.b_image[p.b_count] = image
+        p.b_active[p.b_count] = true
+        p.b_after[p.b_count] = false
+        p.b_delim[p.b_count] = p.d_top
+        p.b_pos[p.b_count] = after
+    else
+        list.push(p.b_node, node)
+        list.push(p.b_image, image)
+        list.push(p.b_active, true)
+        list.push(p.b_after, false)
+        list.push(p.b_delim, p.d_top)
+        list.push(p.b_pos, after)
+    p.b_count = p.b_count + 1
+
+fn close_bracket(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
+    if p.b_count == 0
+        add(p, i_text(), pos, pos + 1)
+        return pos + 1
+    let top = p.b_count - 1
+    if not p.b_active[top]
+        p.b_count = top
+        add(p, i_text(), pos, pos + 1)
+        return pos + 1
+    let opener = p.b_node[top]
+    let image = p.b_image[top]
+    let after = pos + 1
+    var matched = false
+    var end = after
+    var d0 = 0
+    var d1 = 0
+    var t0 = 0
+    var t1 = 0
+    var by_ref = false
+    if peek(p, after) == '('
+        let q = mdscan.skip_spnl(p.text, after + 1, p.n)
+        var dest = (q, q, q)
+        var ok = true
+        if peek(p, q) != ')'
+            dest = mdscan.link_destination(p.text, q, p.n)
+            ok = dest.2 >= 0
+        if ok
+            var r = mdscan.skip_spnl(p.text, dest.2, p.n)
+            var ts = dest.1
+            var te = dest.1
+            var title_ok = true
+            if r > dest.2 and peek(p, r) != ')'
+                let t = mdscan.link_title(p.text, r, p.n)
+                if t.2 >= 0
+                    ts = t.0
+                    te = t.1
+                    r = mdscan.skip_spnl(p.text, t.2, p.n)
+                else
+                    title_ok = false
+            if title_ok and peek(p, r) == ')'
+                matched = true
+                end = r + 1
+                d0 = mdscan.to_source(p.g, dest.0)
+                d1 = mdscan.to_source(p.g, dest.1)
+                t0 = mdscan.to_source(p.g, ts)
+                t1 = mdscan.to_source(p.g, te)
+    if not matched
+        var label = ""
+        var have = false
+        var label_end = after
+        let full = mdscan.link_label(p.text, after, p.n)
+        if full > 0
+            label = str.slice(p.text, after + 1, full - 1)
+            have = true
+            label_end = full
+        elif peek(p, after) == '[' and peek(p, after + 1) == ']'
+            label_end = after + 2
+        if not have and not p.b_after[top]
+            label = str.slice(p.text, p.b_pos[top], pos)
+            have = true
+        elif not have
+            label_end = after
+        if have
+            match blocks.ref_index.get(mdscan.label_key(label))
+                Some(r) =>
+                    matched = true
+                    by_ref = true
+                    end = label_end
+                    d0 = blocks.ref_dest[r].0
+                    d1 = blocks.ref_dest[r].1
+                    t0 = blocks.ref_title[r].0
+                    t1 = if blocks.ref_has_title[r]
+                        blocks.ref_title[r].1
+                    else
+                        blocks.ref_title[r].0
+                None    =>
+                    pass
+    if not matched
+        p.b_count = top
+        add(p, i_text(), pos, pos + 1)
+        return pos + 1
+    let link = new_node(p, (if image then i_image() else i_link()), p.s[opener], end)
+    p.dest0[link] = d0
+    p.dest1[link] = d1
+    p.title0[link] = t0
+    p.title1[link] = t1
+    p.from_ref[link] = by_ref
+    insert_after(p, opener, link)
+    move_between(p, link, -1, link)
+    detach(p, opener)
+    if not image
+        unwrap_autolinks(p, link)
+    process_emphasis(p, p.b_delim[top])
+    p.b_count = top
+    if not image
+        for k in 0..top
+            if not p.b_image[k]
+                p.b_active[k] = false
+    end
+
+// A footnote reference `[^label]` whose label a definition names, as
+// the position after it, or `pos` when it is not one.
+fn footnote_ref(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
+    var k = pos + 2
+    for _ in k..p.n
+        let b = peek(p, k)
+        if b == ']' or b < 0 or mdscan.is_ascii_space(b) or b == '['
+            break
+        k = k + 1
+    if k == pos + 2 or peek(p, k) != ']'
+        return pos
+    if not blocks.foot_index.has(mdscan.label_key(str.slice(p.text, pos + 2, k)))
+        return pos
+    let id = add(p, i_footref(), pos, k + 1)
+    p.dest0[id] = mdscan.to_source(p.g, pos + 2)
+    p.dest1[id] = mdscan.to_source(p.g, k)
+    k + 1
+
+// ── Smart punctuation ─────────────────────────────────────────────────
+
+// Straight quotes to curly ones by which side of a word they are on,
+// `--` and `---` to dashes, and `...` to an ellipsis.
+fn smart(var p: Inl, pos: Int, c: Int) -> Int
+    if c == '.'
+        if peek(p, pos + 1) == '.' and peek(p, pos + 2) == '.'
+            add_char(p, 0x2026, pos, pos + 3)
+            return pos + 3
+        add(p, i_text(), pos, pos + 1)
+        return pos + 1
+    if c == '-'
+        var n = 0
+        for _ in pos..p.n
+            if peek(p, pos + n) != '-'
+                break
+            n = n + 1
+        if n == 1
+            add(p, i_text(), pos, pos + 1)
+            return pos + 1
+        var em = 0
+        var en = 0
+        if n % 3 == 0
+            em = n / 3
+        elif n % 2 == 0
+            en = n / 2
+        elif n % 3 == 2
+            en = 1
+            em = (n - 2) / 3
+        else
+            en = 2
+            em = (n - 4) / 3
+        for _ in 0..em
+            add_char(p, 0x2014, pos, pos + n)
+        for _ in 0..en
+            add_char(p, 0x2013, pos, pos + n)
+        return pos + n
+    let before = mdscan.decode_before(p.text, pos)
+    let after = if pos + 1 >= p.n
+        '\n'
+    else
+        mdscan.decode(p.text, pos + 1, p.n).0
+    let opens = not mdscan.unicode_whitespace(after)
+                and (mdscan.unicode_whitespace(before) or mdscan.unicode_punctuation(before))
+    if c == '"'
+        add_char(p, (if opens then 0x201C else 0x201D), pos, pos + 1)
+    else
+        add_char(p, (if opens then 0x2018 else 0x2019), pos, pos + 1)
+    pos + 1
+
+// ── Extended autolinks (GFM section 6.9) ──────────────────────────────
+
+// Every extended autolink in the text, found before the inline parse:
+// its start mapped to `(end, kind)`, where kind 1 is `www.` (written
+// with `http://` before it), 2 a URL with its scheme, and 3 an email
+// address (written with `mailto:` before it).  The parse turns one into
+// a link when it reaches its start as plain text.
+fn autolink_candidates(t: Str, n: Int) -> HashMap<Int, (Int, Int)>
+    var out: HashMap<Int, (Int, Int)> = HashMap.new()
+    for k in 0..n
+        let b = str.byte_at_or(t, k, 0)
+        if b == 'w' or b == 'W' or b == 'h' or b == 'H' or b == 'f' or b == 'F'
+            let found = url_at(t, k, n)
+            if found.0 > k
+                out.set(k, found)
+        elif b == '@'
+            let found = email_at(t, k, n)
+            if found.0 >= 0
+                out.set(found.0, (found.1, 3))
+    out
+
+// The extended autolink starting at `pos`.
+fn extended(var p: Inl, pos: Int) -> Int
+    let c = p.cands.get(pos) ?? (pos + 1, 2)
+    let link = add(p, i_link(), pos, c.0)
+    p.dest0[link] = mdscan.to_source(p.g, pos)
+    p.dest1[link] = mdscan.to_source(p.g, c.0)
+    p.title0[link] = p.dest1[link]
+    p.title1[link] = p.dest1[link]
+    p.prefix[link] = if c.1 == 1
+        "http://"
+    else if c.1 == 3
+        "mailto:"
+    else
+        ""
+    p.auto[link] = true
+    let inner = new_node(p, i_text(), pos, c.0)
+    append(p, link, inner)
+    c.0
+
+// Whether an autolink may begin at `k`: at the start, or after
+// whitespace or one of `*`, `_`, `~` and `(`.
+fn word_start(t: Str, k: Int) -> Bool
+    if k == 0
+        return true
+    let b = str.byte_at_or(t, k - 1, 0)
+    mdscan.is_ascii_space(b) or b == '*' or b == '_' or b == '~' or b == '('
+
+// A `www.` or `http://`, `https://` or `ftp://` autolink at `k`, as
+// `(end, kind)`, or an end of -1.
+fn url_at(t: Str, k: Int, n: Int) -> (Int, Int)
+    if not word_start(t, k)
+        return (-1, 0)
+    var host = k
+    var kind = 2
+    if mdscan.starts_ci(t, k, n, "www.")
+        host = k + 4
+        kind = 1
+    elif mdscan.starts_ci(t, k, n, "https://")
+        host = k + 8
+    elif mdscan.starts_ci(t, k, n, "http://")
+        host = k + 7
+    elif mdscan.starts_ci(t, k, n, "ftp://")
+        host = k + 6
+    else
+        return (-1, 0)
+    let domain_end = valid_domain(t, (if kind == 1 then k else host), n)
+    if domain_end < 0
+        return (-1, 0)
+    // The link runs to whitespace or `<`, as GFM says, and also stops
+    // at the characters that end a text node here, `*`, `~`, a bracket
+    // and a backtick, since GFM finds autolinks in text nodes after the
+    // inline parse.
+    var z = domain_end
+    for _ in z..n
+        let b = mdscan.at(t, z, n)
+        if b < 0 or mdscan.is_ascii_space(b) or b == '<' or b == '*' or b == '~' or b == '['
+                or b == ']' or b == '`'
+            break
+        z = z + 1
+    // The domain ends in a letter, a digit or a hyphen, none of which
+    // is trimmed, so the link keeps at least its domain.
+    (trim_trailing(t, k, z), kind)
+
+// The end of a valid domain at `a`: segments of letters, digits, `_`
+// and `-` separated by periods, with at least one period and no
+// underscore in the last two segments.  -1 when there is none.
+fn valid_domain(t: Str, a: Int, n: Int) -> Int
+    var k = a
+    var dots = 0
+    var seg_under = false
+    var last_under = false
+    var prev_under = false
+    for _ in a..n
+        let b = mdscan.at(t, k, n)
+        if mdscan.is_alnum(b) or b == '-' or b >= 0x80
+            k = k + 1
+        elif b == '_'
+            seg_under = true
+            k = k + 1
+        elif b == '.' and mdscan.at(t, k + 1, n) >= 0 and (mdscan.is_alnum(mdscan.at(t, k + 1, n))
+                or mdscan.at(t, k + 1, n) == '-' or mdscan.at(t, k + 1, n) == '_')
+            dots = dots + 1
+            prev_under = last_under
+            last_under = seg_under
+            seg_under = false
+            k = k + 1
+        else
+            break
+    prev_under = last_under
+    last_under = seg_under
+    if k == a or dots == 0 or last_under or prev_under
+        return -1
+    k
+
+// Take off the trailing punctuation GFM leaves out of an autolink, an
+// unbalanced closing parenthesis, and an entity-like `&name;`.
+fn trim_trailing(t: Str, a: Int, z: Int) -> Int
+    var e = z
+    for _ in a..z
+        let b = str.byte_at_or(t, e - 1, 0)
+        if b == '?' or b == '!' or b == '.' or b == ',' or b == ':' or b == '*' or b == '_'
+                or b == '~' or b == '\'' or b == '"'
+            e = e - 1
+        elif b == ')' and unbalanced(t, a, e)
+            e = e - 1
+        elif b == ';'
+            var k = e - 2
+            for _ in a..e
+                if k <= a or not mdscan.is_alnum(str.byte_at_or(t, k, 0))
+                    break
+                k = k - 1
+            if k >= a and k < e - 2 and str.byte_at_or(t, k, 0) == '&'
+                e = k
+            else
+                break
+        else
+            break
+    e
+
+fn unbalanced(t: Str, a: Int, z: Int) -> Bool
+    var open = 0
+    var close = 0
+    for k in a..z
+        let b = str.byte_at_or(t, k, 0)
+        if b == '('
+            open = open + 1
+        elif b == ')'
+            close = close + 1
+    close > open
+
+// An email autolink around the `@` at `at`, as `(start, end)`, or a
+// start of -1.  The local part is letters, digits, `.`, `-`, `_` and
+// `+`; the domain holds a period and does not end in `-` or `_`.
+fn email_at(t: Str, at: Int, n: Int) -> (Int, Int)
+    var a = at
+    for _ in 0..at
+        let b = str.byte_at_or(t, a - 1, 0)
+        if a <= 0 or not (mdscan.is_alnum(b) or b == '.' or b == '-' or b == '_' or b == '+')
+            break
+        a = a - 1
+    if a == at or not word_start(t, a)
+        return (-1, 0)
+    var z = at + 1
+    var dots = 0
+    for _ in at + 1..n
+        let b = mdscan.at(t, z, n)
+        if mdscan.is_alnum(b) or b == '-' or b == '_'
+            z = z + 1
+        elif b == '.' and mdscan.is_alnum(mdscan.at(t, z + 1, n))
+            dots = dots + 1
+            z = z + 1
+        else
+            break
+    let last = mdscan.at(t, z - 1, n)
+    if z == at + 1 or dots == 0 or last == '-' or last == '_'
+        return (-1, 0)
+    (a, z)
+
+// Link text holds no link, so an autolink found inside a link's text
+// goes back to being text.
+fn unwrap_autolinks(var p: Inl, link: Int)
+    var c = p.first[link]
+    for _ in 0..list.len(p.kind)
+        if c < 0
+            break
+        let nx = p.next[c]
+        if p.kind[c] == i_link() and p.auto[c]
+            let inner = p.first[c]
+            detach(p, inner)
+            insert_after(p, c, inner)
+            detach(p, c)
+        elif p.first[c] >= 0
+            unwrap_autolinks(p, c)
+        c = nx

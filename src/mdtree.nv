@@ -1,44 +1,32 @@
 // mdtree.nv — the same document as a tree, for the callers that have
 // to look backwards.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A renderer does not need a tree: it acts on each event as it arrives.
+// What needs one is anything that looks at a node's siblings or its
+// parent, such as a linter checking that a heading level does not skip,
+// or a tool that replaces one node of a document.
+//
+// The tree is built from the parser's events rather than by a second
+// parser, so the two cannot disagree, and `events` replays it.  A node
+// carries the same ranges the events do, into the same source, which is
+// why `MdDoc` holds the source.
+//
+// The nodes live in one list and refer to each other by index, so a
+// node index is stable and comparable, and a traversal is an index
+// walk.
 
+use std.str
+use std.list
 use mdparse
 
-// WHO NEEDS A TREE.  A renderer does not: it acts on each event as it
-// arrives.  A table-of-contents builder does not either — it collects
-// headings.  What needs a tree is anything that has to look at a node's
-// SIBLINGS or its PARENT: a linter checking that a heading level does
-// not skip, a transform that unwraps a paragraph inside a tight list
-// item, a document that has to be edited and written back out.
-//
-// So the tree is built from the events rather than by a second parser.
-// There is one parser in this package, and `build` is a fold over its
-// output.  A tree that disagreed with the event stream would be a
-// second implementation of CommonMark hiding inside the first.
-//
-// THE TREE OWNS ITS TEXT AS RANGES TOO.  A node carries the same
-// `MdRange` the event did, into the same source string, which is why
-// `MdDoc` holds the source: a tree of copied strings costs the whole
-// document again, and the caller has the document.
-//
-// THE SHAPE IS A FLAT ARENA, not a linked structure of boxes.  Nodes
-// live in one list and refer to each other by index, so the tree is
-// one allocation rather than one per node, and a traversal is an index
-// walk rather than a pointer chase.  It also means a node index is
-// stable and comparable, which is what a linter reporting "this
-// heading, under that one" needs.
-
-// The index that means "there is no node here" — no parent, no next
-// sibling, no first child.
+// The index that means "there is no node here": no parent, no sibling,
+// no child.
 pub const NO_NODE = 0 - 1
 
 // MdNodeKind is what a node is.
 //
-// The block and inline containers are `MdTag` — the same values the
-// event stream uses, so that a caller who learned one vocabulary knows
-// the other.  The leaves are their own variants because a leaf has no
-// `MdTag` in the event stream either.
+// A container carries the `MdTag` the event stream opened it with, so a
+// caller who learned one vocabulary knows the other.
 pub enum MdNodeKind
     // The root.  Exactly one per document, at index 0.
     NodeDocument
@@ -46,9 +34,9 @@ pub enum MdNodeKind
     NodeContainer(tag: mdparse.MdTag)
     // A verbatim run of source text.
     NodeText(text: mdparse.MdRange)
-    // One decoded character — a character reference or an escape.
+    // One decoded character: a character reference or an escape.
     NodeChar(ch: Int)
-    // The contents of a code span or code block.
+    // The contents of a code span or a line of a code block.
     NodeCode(text: mdparse.MdRange)
     // Raw HTML the document wrote.
     NodeHtml(text: mdparse.MdRange)
@@ -65,32 +53,25 @@ pub struct MdNode
     parent: Int
     // Index of the first child, or `NO_NODE` for a leaf.
     first_child: Int
-    // Index of the last child.  Carried so that appending during the
-    // build is not a walk, and so that a caller reading the last item
-    // of a list does not have to.
+    // Index of the last child, or `NO_NODE`.
     last_child: Int
     // Index of the next sibling, or `NO_NODE`.
     next_sibling: Int
-    // Index of the previous sibling, or `NO_NODE`.  The one a tree of
-    // boxes usually leaves out and a linter always wants.
+    // Index of the previous sibling, or `NO_NODE`.
     previous_sibling: Int
-    // The byte range of the whole node in the source, opener and
-    // closer included.  What a tool that has to REPLACE a node in the
-    // original document needs, and what a diagnostic points at.
+    // The byte range of the whole node in the source, opener and closer
+    // included: what a tool replacing the node in the document needs.
     span: mdparse.MdRange
 
 // MdDoc is a parsed document: the arena, and the source it indexes.
 pub struct MdDoc
-    // The source the ranges point into.  Held here because a range
-    // without its string is meaningless and separating them is how a
-    // caller ends up slicing the wrong document.
+    // The source the ranges point into.
     source: Str
     // Node 0 is the document root; every other node is reachable from
     // it.
     nodes: [MdNode]
-    // True when the parse hit an `MdLimits` bound.  The same flag
-    // `mdparse.parser_truncated` reports, carried onto the tree so a
-    // caller that only has the tree can still ask.
+    // True when the parse reached an `MdLimits` bound, as
+    // `mdparse.parser_truncated` reports it.
     truncated: Bool
 
 // build parses a document into a tree, with the default options.
@@ -98,100 +79,354 @@ pub struct MdDoc
 // ```novo
 // use mdtree
 //
-// fn main() [io]
-//     let doc = mdtree.build("# Title\n\nBody.\n")
-//     println(str.from_int(mdtree.count(doc)))
+// let doc = mdtree.build("# Title\n\nBody.\n")
+// println(str.from_int(mdtree.count(doc)))
 // ```
 pub fn build(source: Str) -> MdDoc []
-    todo("markdown-nv.mdtree.build")
+    build_with(source, mdparse.default_options())
 
 // build_with parses with options of the caller's choosing.
+//
+// ```novo
+// use mdparse
+// use mdtree
+//
+// let doc = mdtree.build_with("| a |\n| - |\n", mdparse.commonmark_options())
+// println(str.from_int(mdtree.count(doc)))
+// ```
 pub fn build_with(source: Str, options: mdparse.MdOptions) -> MdDoc []
-    todo("markdown-nv.mdtree.build_with")
+    let p = mdparse.parser_with(source, options)
+    var kinds: [MdNodeKind] = [NodeDocument]
+    var parent: [Int] = [NO_NODE]
+    var first: [Int] = [NO_NODE]
+    var last: [Int] = [NO_NODE]
+    var next: [Int] = [NO_NODE]
+    var prev: [Int] = [NO_NODE]
+    var spans: [mdparse.MdRange] = [MdRange { start: 0, end: str.len(source) }]
+    var stack: [Int] = [0]
+    for i in 0..list.len(p.events)
+        let ev = p.events[i]
+        let top = stack[list.len(stack) - 1]
+        var id = -1
+        match node_kind(ev)
+            None       =>
+                stack = stack[0:list.len(stack) - 1]
+            Some(kind) =>
+                id = list.len(kinds)
+                list.push(kinds, kind)
+        if id < 0
+            continue
+        list.push(parent, top)
+        list.push(first, NO_NODE)
+        list.push(last, NO_NODE)
+        list.push(next, NO_NODE)
+        list.push(prev, last[top])
+        list.push(spans, p.spans[i])
+        if last[top] != NO_NODE
+            next[last[top]] = id
+        else
+            first[top] = id
+        last[top] = id
+        match ev
+            MdStart(_) =>
+                list.push(stack, id)
+            _          =>
+                pass
+    var nodes: [MdNode] = []
+    for k in 0..list.len(kinds)
+        list.push(nodes, MdNode { kind: kinds[k], parent: parent[k], first_child: first[k],
+                                  last_child: last[k], next_sibling: next[k],
+                                  previous_sibling: prev[k], span: spans[k] })
+    MdDoc { source: source, nodes: nodes, truncated: p.truncated }
+
+// The node an event opens, or `None` for an end event, which closes
+// one.
+fn node_kind(ev: mdparse.MdEvent) -> ?MdNodeKind
+    match ev
+        MdStart(tag)       => Some(NodeContainer(tag))
+        MdText(r)          => Some(NodeText(r))
+        MdChar(c)          => Some(NodeChar(c))
+        MdCode(r)          => Some(NodeCode(r))
+        MdHtml(r)          => Some(NodeHtml(r))
+        MdSoftBreak        => Some(NodeSoftBreak)
+        MdHardBreak        => Some(NodeHardBreak)
+        MdRule             => Some(NodeRule)
+        MdTaskMarker(done) => Some(NodeTaskMarker(done))
+        MdFootnoteRef(l)   => Some(NodeFootnoteRef(l))
+        MdEnd(_)           => None
 
 // root is the document node's index, which is always 0.
 //
-// A function rather than a constant so that a caller's traversal reads
-// the same as every other index it handles.
+// ```novo
+// use mdtree
+//
+// println(str.from_int(mdtree.root(mdtree.build("a\n"))))   // 0
+// ```
 pub fn root(doc: MdDoc) -> Int []
-    todo("markdown-nv.mdtree.root")
+    0
 
-// count is how many nodes the tree holds.
+// count is how many nodes the tree holds, the root included.
+//
+// ```novo
+// use mdtree
+//
+// println(str.from_int(mdtree.count(mdtree.build("a\n"))))   // 3
+// ```
 pub fn count(doc: MdDoc) -> Int []
-    todo("markdown-nv.mdtree.count")
+    list.len(doc.nodes)
 
-// node is the node at an index.
+// node is the node at an index, or `None` for an index out of range.
 //
-// An index out of range is a programming error rather than a document
-// error, so this returns `?MdNode` rather than panicking: a caller
-// that built an index by arithmetic can check, and one that got it
-// from the tree cannot be wrong.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("a\n")
+// println(if mdtree.node(doc, 99) == None then "none" else "some")   // none
+// ```
 pub fn node(doc: MdDoc, index: Int) -> ?MdNode []
-    todo("markdown-nv.mdtree.node")
+    if index < 0 or index >= list.len(doc.nodes)
+        return None
+    Some(doc.nodes[index])
 
-// children is every child index of a node, in order.
+// children is every child index of a node, in order.  `first_child`
+// and `next_sibling` are the same walk without the list.
 //
-// The allocating convenience.  `MdNode.first_child` and
-// `next_sibling` are the walk that allocates nothing, and a traversal
-// in a hot path should use them.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("# t\n\nbody\n")
+// println(str.from_int(list.len(mdtree.children(doc, 0))))   // 2
+// ```
 pub fn children(doc: MdDoc, index: Int) -> [Int] []
-    todo("markdown-nv.mdtree.children")
+    var out: [Int] = []
+    if index < 0 or index >= list.len(doc.nodes)
+        return out
+    var c = doc.nodes[index].first_child
+    for _ in 0..list.len(doc.nodes)
+        if c == NO_NODE
+            break
+        list.push(out, c)
+        c = doc.nodes[c].next_sibling
+    out
 
-// text is the source text a node's range names.
+// text is the source text a node's span covers.
+//
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("*a*\n")
+// print(mdtree.text(doc, 1))   // *a*
+// ```
 pub fn text(doc: MdDoc, index: Int) -> Str []
-    todo("markdown-nv.mdtree.text")
+    match node(doc, index)
+        Some(n) => str.slice(doc.source, n.span.start, n.span.end)
+        None    => ""
 
-// inner_text is every text leaf under a node, concatenated.
+// inner_text is every text leaf under a node, concatenated: the words
+// with the markup gone.  A code span's contents are included, and an
+// image's alt text; a link's destination is not, and a line ending is
+// one space.
 //
-// What a heading's anchor, a search index's excerpt and a table of
-// contents all want: the words, with the markup gone.  A code span's
-// contents ARE included — a heading that names a function in backticks
-// is about that function — and an image's alt text is included, which
-// is what an accessible excerpt means.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("## A *bold* `fn`\n")
+// println(mdtree.inner_text(doc, 1))   // A bold fn
+// ```
 pub fn inner_text(doc: MdDoc, index: Int) -> Str []
-    todo("markdown-nv.mdtree.inner_text")
+    var parts: [Str] = []
+    for k in subtree(doc, index)
+        match doc.nodes[k].kind
+            NodeText(r)   =>
+                list.push(parts, str.slice(doc.source, r.start, r.end))
+            NodeCode(r)   =>
+                list.push(parts, str.slice(doc.source, r.start, r.end))
+            NodeChar(c)   =>
+                list.push(parts, str.from_char(c))
+            NodeSoftBreak =>
+                list.push(parts, " ")
+            NodeHardBreak =>
+                list.push(parts, " ")
+            _             =>
+                pass
+    str.join(parts, "")
 
-// headings is every heading node in document order.
+// Every node under `index`, in document order, not counting `index`.
+fn subtree(doc: MdDoc, index: Int) -> [Int]
+    var out: [Int] = []
+    if index < 0 or index >= list.len(doc.nodes)
+        return out
+    var c = doc.nodes[index].first_child
+    for _ in 0..list.len(doc.nodes)
+        if c == NO_NODE
+            break
+        list.push(out, c)
+        let n = doc.nodes[c]
+        if n.first_child != NO_NODE
+            c = n.first_child
+            continue
+        var up = c
+        for _ in 0..list.len(doc.nodes)
+            if up == index or up == NO_NODE
+                break
+            if doc.nodes[up].next_sibling != NO_NODE
+                break
+            up = doc.nodes[up].parent
+        if up == index or up == NO_NODE
+            break
+        c = doc.nodes[up].next_sibling
+    out
+
+fn select(doc: MdDoc, keep: fn(MdNodeKind) -> Bool) -> [Int]
+    var out: [Int] = []
+    for k in subtree(doc, 0)
+        if keep(doc.nodes[k].kind)
+            list.push(out, k)
+    out
+
+fn is_heading(k: MdNodeKind) -> Bool
+    match k
+        NodeContainer(TagHeading(_, _)) => true
+        _                               => false
+
+fn is_link(k: MdNodeKind) -> Bool
+    match k
+        NodeContainer(TagLink(_))  => true
+        NodeContainer(TagImage(_)) => true
+        _                          => false
+
+fn is_code_block(k: MdNodeKind) -> Bool
+    match k
+        NodeContainer(TagCodeBlock(_)) => true
+        _                              => false
+
+// headings is every heading node in document order, those inside block
+// quotes and list items included.
 //
-// Here rather than left to the caller because a table of contents is
-// the single most common reason to build a tree at all, and because
-// the walk that gets it right — headings nested inside block quotes
-// and list items count — is the one a caller writes wrongly first.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("# a\n\n> ## b\n")
+// println(str.from_int(list.len(mdtree.headings(doc))))   // 2
+// ```
 pub fn headings(doc: MdDoc) -> [Int] []
-    todo("markdown-nv.mdtree.headings")
+    select(doc, is_heading)
 
 // links is every link and image node in document order.
 //
-// What a build-time link checker walks.  The site generator does this
-// today by searching the RENDERED HTML for `href="`, which finds the
-// href in a code sample too; a tree answers the question that was
-// actually being asked.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("[a](/x) and ![b](/y.png)\n")
+// println(str.from_int(list.len(mdtree.links(doc))))   // 2
+// ```
 pub fn links(doc: MdDoc) -> [Int] []
-    todo("markdown-nv.mdtree.links")
+    select(doc, is_link)
 
 // code_blocks is every code block node in document order, fenced and
 // indented alike.
 //
-// For a documentation tool that compiles its examples — which is what
-// `novo doc` does to the blocks in this file.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("    x\n\n```\ny\n```\n")
+// println(str.from_int(list.len(mdtree.code_blocks(doc))))   // 2
+// ```
 pub fn code_blocks(doc: MdDoc) -> [Int] []
-    todo("markdown-nv.mdtree.code_blocks")
+    select(doc, is_code_block)
 
 // find_first is the first node under `from` for which `keep` answers
-// true, in document order.
+// true, in document order, or `NO_NODE`.
 //
-// A generic walk, so that the four functions above are conveniences
-// rather than the only queries there are.  `NO_NODE` when nothing
-// matches.
+// ```novo
+// use mdtree
+//
+// fn is_rule(k: MdNodeKind) -> Bool
+//     k == NodeRule
+//
+// let doc = mdtree.build("a\n\n---\n")
+// println(str.from_int(mdtree.find_first(doc, 0, is_rule)))   // 3
+// ```
 pub fn find_first(doc: MdDoc, from: Int, keep: fn(MdNodeKind) -> Bool) -> Int []
-    todo("markdown-nv.mdtree.find_first")
+    for k in subtree(doc, from)
+        if keep(doc.nodes[k].kind)
+            return k
+    NO_NODE
 
-// events replays the tree as the event stream it was built from.
+// events replays the tree as the events it was built from, in the same
+// order.  A tree a caller changed renders through the same renderer.
 //
-// The round trip, and the test that the two surfaces agree: the events
-// out of this function are the events `mdparse` produced, in the same
-// order.  It is also how a caller that transformed the tree renders
-// it — `mdhtml` takes events, so a transformed tree renders through
-// the same renderer as an untransformed document.
+// ```novo
+// use mdtree
+//
+// let doc = mdtree.build("*a*\n")
+// println(str.from_int(list.len(mdtree.events(doc))))   // 5
+// ```
 pub fn events(doc: MdDoc) -> [mdparse.MdEvent] []
-    todo("markdown-nv.mdtree.events")
+    subtree_events(doc, 0)
+
+// The events of every node under `index`, and of `index` itself unless
+// it is the root.
+fn subtree_events(doc: MdDoc, index: Int) -> [mdparse.MdEvent]
+    var out: [mdparse.MdEvent] = []
+    if index < 0 or index >= list.len(doc.nodes)
+        return out
+    open_event(doc, index, out)
+    var c = doc.nodes[index].first_child
+    for _ in 0..list.len(doc.nodes)
+        if c == NO_NODE
+            break
+        open_event(doc, c, out)
+        let n = doc.nodes[c]
+        if n.first_child != NO_NODE
+            c = n.first_child
+            continue
+        var up = c
+        for _ in 0..list.len(doc.nodes)
+            if up == index or up == NO_NODE
+                break
+            if doc.nodes[up].next_sibling != NO_NODE
+                break
+            up = doc.nodes[up].parent
+            if up != index and up != NO_NODE
+                close_event(doc, up, out)
+        if up == index or up == NO_NODE
+            break
+        c = doc.nodes[up].next_sibling
+    close_event(doc, index, out)
+    out
+
+fn open_event(doc: MdDoc, id: Int, var out: [mdparse.MdEvent])
+    match doc.nodes[id].kind
+        NodeContainer(tag) =>
+            list.push(out, MdStart(tag))
+            if doc.nodes[id].first_child == NO_NODE
+                list.push(out, MdEnd(tag))
+        NodeText(r)        =>
+            list.push(out, MdText(r))
+        NodeChar(c)        =>
+            list.push(out, MdChar(c))
+        NodeCode(r)        =>
+            list.push(out, MdCode(r))
+        NodeHtml(r)        =>
+            list.push(out, MdHtml(r))
+        NodeSoftBreak      =>
+            list.push(out, MdSoftBreak)
+        NodeHardBreak      =>
+            list.push(out, MdHardBreak)
+        NodeRule           =>
+            list.push(out, MdRule)
+        NodeTaskMarker(d)  =>
+            list.push(out, MdTaskMarker(d))
+        NodeFootnoteRef(l) =>
+            list.push(out, MdFootnoteRef(l))
+        NodeDocument       =>
+            pass
+
+fn close_event(doc: MdDoc, id: Int, var out: [mdparse.MdEvent])
+    match doc.nodes[id].kind
+        NodeContainer(tag) =>
+            if doc.nodes[id].first_child != NO_NODE
+                list.push(out, MdEnd(tag))
+        _                  =>
+            pass
