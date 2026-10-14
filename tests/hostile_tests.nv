@@ -1,0 +1,44 @@
+// hostile_tests.nv — documents that nest, or that leave delimiters
+// open, a few hundred kilobytes deep.
+
+use std.test
+use std.str
+use mdhtml
+
+fn renders(source: Str) -> Bool [io]
+    let out = mdhtml.render_str(source, mdhtml.default_options())
+    str.len(out) > 0
+
+@test
+fn test_deep_container_nesting_renders() [io]
+    test.case("block quotes")
+    test.assert(renders(">".repeat(100000) + " a\n"))
+    test.case("nested list items")
+    test.assert(renders("- ".repeat(50000) + "a\n"))
+    test.case("indented lists")
+    var text = ""
+    for i in 0..2000
+        text = text + " ".repeat(i) + "- a\n"
+    test.assert(renders(text))
+
+@test
+fn test_open_delimiters_render_in_bounded_time() [io]
+    test.case("opening brackets")
+    test.assert(renders("[".repeat(200000) + "\n"))
+    test.case("opening images")
+    test.assert(renders("![".repeat(100000) + "\n"))
+    test.case("unmatched emphasis")
+    test.assert(renders("*a ".repeat(100000) + "\n"))
+    test.case("underscores")
+    test.assert(renders("_a ".repeat(100000) + "\n"))
+    test.case("backtick runs of growing length")
+    var ticks = ""
+    for i in 1..1500
+        ticks = ticks + "`".repeat(i) + " "
+    test.assert(renders(ticks))
+    test.case("angle brackets")
+    test.assert(renders("<a ".repeat(100000) + "\n"))
+    test.case("link destinations")
+    test.assert(renders("[a](".repeat(50000) + "\n"))
+    test.case("nested parentheses in a link")
+    test.assert(renders("[a](" + "(".repeat(100000) + ")".repeat(100000) + ")\n"))
