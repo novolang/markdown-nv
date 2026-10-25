@@ -1,6 +1,6 @@
 [package]
 name        = "markdown-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "CommonMark 0.31.2 plus the GFM tables, strikethrough, task lists, footnotes and extended autolinks, as a pull parser whose events carry byte ranges into the caller's source rather than copied strings, a flat-arena tree built from the same events, and an HTML renderer that appends to a buffer the caller owns.  Raw HTML is escaped by default and a link destination is admitted by a rule the caller supplies, because the input to a Markdown renderer is usually a document somebody else wrote."
 license     = "Apache-2.0"
 
@@ -21,7 +21,7 @@ category    = "text"
 tags        = ["markdown", "commonmark", "gfm", "pull-parser", "html", "renderer", "pulldown-cmark", "sans-io", "zero-copy"]
 repository  = "https://github.com/novolang/markdown-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.13.0"
+novo        = ">= 0.21.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

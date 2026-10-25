@@ -828,12 +828,12 @@ fn source_pieces(g: Segs, bs: Int, be: Int) -> [(Int, Int)]
                 be
             else
                 seg_end
-            push_piece(out, g.src[k] + (p - g.at[k]), g.src[k] + (e - g.at[k]))
+            push_piece(var out, g.src[k] + (p - g.at[k]), g.src[k] + (e - g.at[k]))
             p = e
         if p >= be
             break
         if g.join_len[k] > 0 and p == seg_end
-            push_piece(out, g.join_at[k], g.join_at[k] + g.join_len[k])
+            push_piece(var out, g.join_at[k], g.join_at[k] + g.join_len[k])
             p = p + 1
         k = k + 1
     out

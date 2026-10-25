@@ -198,7 +198,7 @@ fn advance(var ln: Line, count: Int, columns: Bool)
             n = n - 1
 
 fn advance_to_nonspace(var ln: Line)
-    advance(ln, ln.fns - ln.offset, false)
+    advance(var ln, ln.fns - ln.offset, false)
 
 // Parse a document's blocks.
 fn parse(source: Str, opts: BlockOpts) -> Blocks
@@ -209,18 +209,18 @@ fn parse(source: Str, opts: BlockOpts) -> Blocks
                       aligns: [], ref_index: HashMap.new(), ref_label: [], ref_dest: [],
                       ref_title: [], ref_has_title: [], foot_index: HashMap.new(), tip: 0,
                       line_no: 0, truncated: false }
-    new_block(st, k_doc(), -1, 0)
+    new_block(var st, k_doc(), -1, 0)
     let lines = mdscan.line_table(source)
     for i in 0..list.len(lines)
         st.line_no = i + 1
         let l = lines[i]
         var ln = Line { s: source, start: l.0, end: l.1, next: l.2, offset: l.0, column: 0,
                         partial: false, fns: l.0, fns_col: 0, indent: 0, blank: false }
-        process_line(st, ln)
+        process_line(var st, var ln)
     for _ in 0..list.len(st.kind)
         if st.tip < 0
             break
-        st.tip = finalize(st, st.tip)
+        st.tip = finalize(var st, st.tip)
     st
 
 fn new_block(var st: Blocks, kind: Int, parent: Int, start: Int) -> Int
@@ -283,8 +283,8 @@ fn add_child(var st: Blocks, parent: Int, kind: Int, start: Int) -> Int
     for _ in 0..list.len(st.kind)
         if can_contain(st.kind[p], kind)
             break
-        p = finalize(st, p)
-    new_block(st, kind, p, start)
+        p = finalize(var st, p)
+    new_block(var st, kind, p, start)
 
 // Whether a new container under `parent` stays within the nesting
 // bound.  Past it, the bound is recorded and the line's remaining text
@@ -309,7 +309,7 @@ fn add_rest(var st: Blocks, id: Int, var ln: Line)
     if ln.partial
         pad = 4 - ln.column % 4
         ln.offset = ln.offset + 1
-    add_line(st, id, ln, ln.offset, pad)
+    add_line(var st, id, ln, ln.offset, pad)
 
 fn process_line(var st: Blocks, var ln: Line)
     // 1. The open containers, from the outside in.
@@ -319,8 +319,8 @@ fn process_line(var st: Blocks, var ln: Line)
         let child = st.last[container]
         if child < 0 or not st.open[child]
             break
-        find_nonspace(ln)
-        let verdict = continues(st, child, ln)
+        find_nonspace(var ln)
+        let verdict = continues(var st, child, var ln)
         if verdict == 2
             return
         if verdict == 0
@@ -334,22 +334,22 @@ fn process_line(var st: Blocks, var ln: Line)
         let ck = st.kind[container]
         if ck == k_fenced() or ck == k_indented() or ck == k_html()
             break
-        find_nonspace(ln)
+        find_nonspace(var ln)
         let indented = ln.indent >= 4
         let c = peek(ln, ln.fns)
         if not indented and c == '>'
-            if not room_for(st, container)
+            if not room_for(var st, container)
                 break
             let at = ln.fns
-            advance_to_nonspace(ln)
-            advance(ln, 1, false)
+            advance_to_nonspace(var ln)
+            advance(var ln, 1, false)
             if mdscan.is_space_or_tab(peek(ln, ln.offset))
-                advance(ln, 1, true)
-            container = add_child(st, container, k_quote(), at)
+                advance(var ln, 1, true)
+            container = add_child(var st, container, k_quote(), at)
         elif not indented and mdscan.atx_level(ln.s, ln.fns, ln.end) > 0
             let level = mdscan.atx_level(ln.s, ln.fns, ln.end)
             let body = mdscan.atx_content(ln.s, ln.fns, ln.end, level)
-            container = add_child(st, container, k_heading(), ln.fns)
+            container = add_child(var st, container, k_heading(), ln.fns)
             st.a[container] = level
             st.r0[container] = body.0
             st.r1[container] = body.1
@@ -358,7 +358,7 @@ fn process_line(var st: Blocks, var ln: Line)
         elif not indented and mdscan.fence_open(ln.s, ln.fns, ln.end).1 > 0
             let f = mdscan.fence_open(ln.s, ln.fns, ln.end)
             let fence_indent = ln.fns - ln.offset
-            container = add_child(st, container, k_fenced(), ln.fns)
+            container = add_child(var st, container, k_fenced(), ln.fns)
             st.a[container] = f.0
             st.b[container] = f.1
             st.c[container] = fence_indent
@@ -370,13 +370,13 @@ fn process_line(var st: Blocks, var ln: Line)
         elif not indented and mdscan.html_block_start(ln.s, ln.fns, ln.end,
                                                        st.kind[container] != k_para()) > 0
             let kind = mdscan.html_block_start(ln.s, ln.fns, ln.end, st.kind[container] != k_para())
-            container = add_child(st, container, k_html(), ln.fns)
+            container = add_child(var st, container, k_html(), ln.fns)
             st.a[container] = kind
             break
         elif not indented and st.kind[container] == k_para()
                 and mdscan.setext_level(ln.s, ln.fns, ln.end) > 0
             let level = mdscan.setext_level(ln.s, ln.fns, ln.end)
-            if take_refs(st, container)
+            if take_refs(var st, container)
                 st.kind[container] = k_heading()
                 st.a[container] = level
                 st.b[container] = 1
@@ -384,40 +384,40 @@ fn process_line(var st: Blocks, var ln: Line)
                 break
             break
         elif not indented and mdscan.thematic_break(ln.s, ln.fns, ln.end)
-            container = add_child(st, container, k_rule(), ln.fns)
+            container = add_child(var st, container, k_rule(), ln.fns)
             ln.offset = ln.end
             break
         elif not indented and st.opts.tables and st.kind[container] == k_para()
-                and table_start(st, container, ln) >= 0
+                and table_start(var st, container, ln) >= 0
             container = st.last[st.parent[container]]
             ln.offset = ln.end
             break
         elif not indented and st.opts.footnotes and footnote_start(ln) > 0
-            if not room_for(st, container)
+            if not room_for(var st, container)
                 break
             let label_end = footnote_start(ln)
             let at = ln.fns
-            container = add_child(st, container, k_foot(), at)
+            container = add_child(var st, container, k_foot(), at)
             st.r0[container] = at + 2
             st.r1[container] = label_end
             st.foot_index.set(mdscan.label_key(str.slice(ln.s, at + 2, label_end)), container)
-            advance(ln, label_end + 2 - ln.offset, false)
-            find_nonspace(ln)
-            advance_to_nonspace(ln)
+            advance(var ln, label_end + 2 - ln.offset, false)
+            find_nonspace(var ln)
+            advance_to_nonspace(var ln)
         elif not indented and list_marker(ln, st.kind[container] == k_para()).0 > 0
-            if not room_for(st, container)
+            if not room_for(var st, container)
                 break
             let m = list_marker(ln, st.kind[container] == k_para())
             let marker_offset = ln.indent
             let at = ln.fns
-            advance(ln, ln.fns + m.0 - ln.offset, false)
+            advance(var ln, ln.fns + m.0 - ln.offset, false)
             let save_offset = ln.offset
             let save_column = ln.column
             let save_partial = ln.partial
             for _ in 0..6
                 if ln.column - save_column > 5 or not mdscan.is_space_or_tab(peek(ln, ln.offset))
                     break
-                advance(ln, 1, true)
+                advance(var ln, 1, true)
             let spaces = ln.column - save_column
             var padding = m.0 + spaces
             if spaces >= 5 or spaces < 1 or mdscan.is_line_end(peek(ln, ln.offset))
@@ -426,27 +426,27 @@ fn process_line(var st: Blocks, var ln: Line)
                 ln.column = save_column
                 ln.partial = save_partial
                 if spaces > 0
-                    advance(ln, 1, true)
+                    advance(var ln, 1, true)
             if st.kind[container] != k_list() or not lists_match(st, container, m)
                 if depth_of(st, container) + 2 > st.opts.max_nesting
                     st.truncated = true
                     break
-                container = add_child(st, container, k_list(), at)
+                container = add_child(var st, container, k_list(), at)
                 st.a[container] = m.1
                 st.b[container] = m.2
                 st.c[container] = m.3
-            container = add_child(st, container, k_item(), at)
+            container = add_child(var st, container, k_item(), at)
             st.a[container] = marker_offset
             st.b[container] = padding
         elif indented and not maybe_lazy and not ln.blank
-            advance(ln, 4, true)
-            container = add_child(st, container, k_indented(), ln.offset)
+            advance(var ln, 4, true)
+            container = add_child(var st, container, k_indented(), ln.offset)
             break
         else
             break
         maybe_lazy = false
     // 3. The rest of the line.
-    find_nonspace(ln)
+    find_nonspace(var ln)
     let ck = st.kind[container]
     if ln.blank and st.last[container] >= 0
         st.blank_end[st.last[container]] = true
@@ -462,40 +462,40 @@ fn process_line(var st: Blocks, var ln: Line)
         up = st.parent[up]
     if st.tip != last_matched and container == last_matched and not ln.blank
             and st.kind[st.tip] == k_para() and st.open[st.tip]
-        add_line(st, st.tip, ln, ln.fns, 0)
-        extend(st, st.tip, ln.next)
+        add_line(var st, st.tip, ln, ln.fns, 0)
+        extend(var st, st.tip, ln.next)
         return
     var t = st.tip
     for _ in 0..list.len(st.kind)
         if t == last_matched or t < 0
             break
         if st.open[t]
-            finalize(st, t)
+            finalize(var st, t)
         t = st.parent[t]
     st.tip = container
     if ck == k_indented() or ck == k_fenced()
         if ck == k_fenced() and st.start_line[container] == st.line_no
-            extend(st, container, ln.next)
+            extend(var st, container, ln.next)
             return
-        add_rest(st, container, ln)
+        add_rest(var st, container, var ln)
     elif ck == k_html()
-        add_rest(st, container, ln)
+        add_rest(var st, container, var ln)
         let kind = st.a[container]
         if kind >= 1 and kind <= 5 and mdscan.html_block_ends(ln.s, ln.fns, ln.end, kind)
-            extend(st, container, ln.next)
-            st.tip = finalize(st, container)
+            extend(var st, container, ln.next)
+            st.tip = finalize(var st, container)
             return
     elif not ln.blank and ck != k_heading() and ck != k_rule()
         if ck == k_table()
             if st.start_line[container] != st.line_no
-                add_line(st, container, ln, ln.fns, 0)
+                add_line(var st, container, ln, ln.fns, 0)
         elif ck == k_para()
-            add_line(st, container, ln, ln.fns, 0)
+            add_line(var st, container, ln, ln.fns, 0)
         else
-            let p = add_child(st, container, k_para(), ln.fns)
-            add_line(st, p, ln, ln.fns, 0)
+            let p = add_child(var st, container, k_para(), ln.fns)
+            add_line(var st, p, ln, ln.fns, 0)
             st.tip = p
-    extend(st, st.tip, ln.next)
+    extend(var st, st.tip, ln.next)
 
 // Stretch the spans of `id` and every block around it to `stop`.
 fn extend(var st: Blocks, id: Int, stop: Int)
@@ -514,47 +514,47 @@ fn continues(var st: Blocks, id: Int, var ln: Line) -> Int
     let kind = st.kind[id]
     if kind == k_quote()
         if ln.indent < 4 and peek(ln, ln.fns) == '>'
-            advance_to_nonspace(ln)
-            advance(ln, 1, false)
+            advance_to_nonspace(var ln)
+            advance(var ln, 1, false)
             if mdscan.is_space_or_tab(peek(ln, ln.offset))
-                advance(ln, 1, true)
+                advance(var ln, 1, true)
             return 1
         return 0
     if kind == k_item()
         let need = st.a[id] + st.b[id]
         if ln.indent >= need
-            advance(ln, need, true)
+            advance(var ln, need, true)
             return 1
         if ln.blank and st.first[id] >= 0
-            advance_to_nonspace(ln)
+            advance_to_nonspace(var ln)
             return 1
         return 0
     if kind == k_foot()
         if ln.indent >= 4
-            advance(ln, 4, true)
+            advance(var ln, 4, true)
             return 1
         if ln.blank
-            advance_to_nonspace(ln)
+            advance_to_nonspace(var ln)
             return 1
         return 0
     if kind == k_indented()
         if ln.indent >= 4
-            advance(ln, 4, true)
+            advance(var ln, 4, true)
             return 1
         if ln.blank
-            advance_to_nonspace(ln)
+            advance_to_nonspace(var ln)
             return 1
         return 0
     if kind == k_fenced()
         if ln.indent < 4 and mdscan.fence_close(ln.s, ln.fns, ln.end, st.a[id], st.b[id])
-            extend(st, id, ln.next)
-            st.tip = finalize(st, id)
+            extend(var st, id, ln.next)
+            st.tip = finalize(var st, id)
             return 2
         var i = st.c[id]
         for _ in 0..st.c[id] + 1
             if i <= 0 or not mdscan.is_space_or_tab(peek(ln, ln.offset))
                 break
-            advance(ln, 1, true)
+            advance(var ln, 1, true)
             i = i - 1
         return 1
     if kind == k_html()
@@ -664,8 +664,8 @@ fn finalize(var st: Blocks, id: Int) -> Int
     let kind = st.kind[id]
     let parent = st.parent[id]
     if kind == k_para()
-        if not take_refs(st, id)
-            unlink(st, id)
+        if not take_refs(var st, id)
+            unlink(var st, id)
     elif kind == k_indented()
         // The first line is not blank, so the walk stops by it.
         var e = st.l1[id]
@@ -905,11 +905,11 @@ fn table_start(var st: Blocks, para: Int, ln: Line) -> Int
     st.l1[para] = h
     let parent = st.parent[para]
     if st.l1[para] <= st.l0[para]
-        unlink(st, para)
+        unlink(var st, para)
         st.open[para] = false
     else
-        finalize(st, para)
-    let id = new_block(st, k_table(), parent, header_start)
+        finalize(var st, para)
+    let id = new_block(var st, k_table(), parent, header_start)
     st.l0[id] = h
     st.l1[id] = h + 1
     st.c[id] = list.len(st.aligns)

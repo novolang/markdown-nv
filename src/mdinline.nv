@@ -184,17 +184,17 @@ fn move_between(var p: Inl, from: Int, until: Int, into: Int)
         if cur < 0 or cur == until
             break
         let nx = p.next[cur]
-        detach(p, cur)
-        append(p, into, cur)
+        detach(var p, cur)
+        append(var p, into, cur)
         cur = nx
 
 fn add(var p: Inl, kind: Int, s: Int, e: Int) -> Int
-    let id = new_node(p, kind, s, e)
-    append(p, 0, id)
+    let id = new_node(var p, kind, s, e)
+    append(var p, 0, id)
     id
 
 fn add_char(var p: Inl, cp: Int, s: Int, e: Int)
-    let id = add(p, i_char(), s, e)
+    let id = add(var p, i_char(), s, e)
     p.ch[id] = cp
 
 fn peek(p: Inl, i: Int) -> Int
@@ -213,13 +213,13 @@ fn parse(g: mdscan.Segs, blocks: mdblock.Blocks, o: InlineOpts) -> Inl
                   d_next: [], d_top: -1, d_live: 0, b_node: [], b_image: [], b_active: [],
                   b_after: [], b_delim: [], b_pos: [], b_count: 0, truncated: false,
                   cands: cands }
-    new_node(p, i_root(), 0, p.n)
+    new_node(var p, i_root(), 0, p.n)
     var pos = 0
     for _ in 0..p.n + 1
         if pos >= p.n
             break
-        pos = step(p, blocks, pos)
-    process_emphasis(p, -1)
+        pos = step(var p, blocks, pos)
+    process_emphasis(var p, -1)
     p
 
 // The length of `t` without its trailing spaces, tabs and line endings.
@@ -237,40 +237,40 @@ fn rtrimmed_len(t: Str) -> Int
 // Read one construct at `pos` and answer the position after it.
 fn step(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
     if p.opts.autolinks and p.cands.has(pos)
-        return extended(p, pos)
+        return extended(var p, pos)
     let c = peek(p, pos)
     if c == '\n'
-        return newline(p, pos)
+        return newline(var p, pos)
     if c == '`'
-        return code_span(p, pos)
+        return code_span(var p, pos)
     if c == '\\'
-        return backslash(p, pos)
+        return backslash(var p, pos)
     if c == '&'
         return entity(p, pos)
     if c == '<'
-        return angle(p, pos)
+        return angle(var p, pos)
     if c == '*' or c == '_' or c == '~' and p.opts.strikethrough
-        return delimiters(p, pos, c)
+        return delimiters(var p, pos, c)
     if c == '['
         if p.opts.footnotes and peek(p, pos + 1) == '^'
-            let f = footnote_ref(p, blocks, pos)
+            let f = footnote_ref(var p, blocks, pos)
             if f > pos
                 return f
-        let id = add(p, i_text(), pos, pos + 1)
-        push_bracket(p, id, false, pos + 1)
+        let id = add(var p, i_text(), pos, pos + 1)
+        push_bracket(var p, id, false, pos + 1)
         return pos + 1
     if c == '!'
         if peek(p, pos + 1) == '['
-            let id = add(p, i_text(), pos, pos + 2)
-            push_bracket(p, id, true, pos + 2)
+            let id = add(var p, i_text(), pos, pos + 2)
+            push_bracket(var p, id, true, pos + 2)
             return pos + 2
-        add(p, i_text(), pos, pos + 1)
+        add(var p, i_text(), pos, pos + 1)
         return pos + 1
     if c == ']'
-        return close_bracket(p, blocks, pos)
+        return close_bracket(var p, blocks, pos)
     if p.opts.smart and (c == '"' or c == '\'' or c == '.' or c == '-')
-        return smart(p, pos, c)
-    text_run(p, pos)
+        return smart(var p, pos, c)
+    text_run(var p, pos)
 
 fn special(p: Inl, b: Int) -> Bool
     if b == '\n' or b == '`' or b == '\\' or b == '&' or b == '<' or b == '*' or b == '_'
@@ -297,7 +297,7 @@ fn text_run(var p: Inl, pos: Int) -> Int
                 break
             e = e - 1
     if e > pos
-        add(p, i_text(), pos, e)
+        add(var p, i_text(), pos, e)
     k
 
 // A line ending: a hard break when two spaces come before it, a soft
@@ -305,7 +305,7 @@ fn text_run(var p: Inl, pos: Int) -> Int
 // left out when the block kept its lines.
 fn newline(var p: Inl, pos: Int) -> Int
     let hard = pos >= 2 and peek(p, pos - 1) == ' ' and peek(p, pos - 2) == ' '
-    add(p, (if hard then i_hard() else i_soft()), pos, pos + 1)
+    add(var p, (if hard then i_hard() else i_soft()), pos, pos + 1)
     pos + 1
 
 // A backslash escape (section 2.4), or a hard break before a line
@@ -313,21 +313,21 @@ fn newline(var p: Inl, pos: Int) -> Int
 fn backslash(var p: Inl, pos: Int) -> Int
     let b = peek(p, pos + 1)
     if b == '\n'
-        add(p, i_hard(), pos, pos + 2)
+        add(var p, i_hard(), pos, pos + 2)
         return pos + 2
     if mdscan.is_ascii_punct(b)
-        add_char(p, b, pos, pos + 2)
+        add_char(var p, b, pos, pos + 2)
         return pos + 2
-    add(p, i_text(), pos, pos + 1)
+    add(var p, i_text(), pos, pos + 1)
     pos + 1
 
 fn entity(var p: Inl, pos: Int) -> Int
     let e = mdscan.entity(p.text, pos, p.n)
     if list.len(e.0) == 0
-        add(p, i_text(), pos, pos + 1)
+        add(var p, i_text(), pos, pos + 1)
         return pos + 1
     for cp in e.0
-        add_char(p, cp, pos, e.1)
+        add_char(var p, cp, pos, e.1)
     e.1
 
 // A code span (section 6.1): a backtick run closed by a run of the
@@ -361,11 +361,11 @@ fn code_span(var p: Inl, pos: Int) -> Int
                     and not all_spaces(p, a, z)
                 a = a + 1
                 z = z - 1
-            let id = add(p, i_code(), a, z)
+            let id = add(var p, i_code(), a, z)
             p.s[id] = a
             return k + m
         k = k + m
-    add(p, i_text(), pos, open_end)
+    add(var p, i_text(), pos, open_end)
     open_end
 
 fn all_spaces(p: Inl, a: Int, z: Int) -> Bool
@@ -379,7 +379,7 @@ fn all_spaces(p: Inl, a: Int, z: Int) -> Bool
 fn angle(var p: Inl, pos: Int) -> Int
     let auto = mdscan.autolink(p.text, pos, p.n)
     if auto.0 > 0
-        let id = add(p, i_link(), pos, auto.0)
+        let id = add(var p, i_link(), pos, auto.0)
         p.dest0[id] = mdscan.to_source(p.g, pos + 1)
         p.dest1[id] = mdscan.to_source(p.g, auto.0 - 1)
         p.title0[id] = p.dest1[id]
@@ -389,14 +389,14 @@ fn angle(var p: Inl, pos: Int) -> Int
         else
             ""
         p.auto[id] = true
-        let t = new_node(p, i_text(), pos + 1, auto.0 - 1)
-        append(p, id, t)
+        let t = new_node(var p, i_text(), pos + 1, auto.0 - 1)
+        append(var p, id, t)
         return auto.0
     let html = mdscan.raw_html(p.text, pos, p.n)
     if html > 0
-        add(p, i_html(), pos, html)
+        add(var p, i_html(), pos, html)
         return html
-    add(p, i_text(), pos, pos + 1)
+    add(var p, i_text(), pos, pos + 1)
     pos + 1
 
 // A run of `*`, `_` or `~` (section 6.2).  Whether it can open or close
@@ -407,7 +407,7 @@ fn delimiters(var p: Inl, pos: Int, c: Int) -> Int
         if peek(p, pos + n) != c
             break
         n = n + 1
-    let id = add(p, i_text(), pos, pos + n)
+    let id = add(var p, i_text(), pos, pos + n)
     if c == '~' and n > 2
         return pos + n
     let before = mdscan.decode_before(p.text, pos)
@@ -430,7 +430,7 @@ fn delimiters(var p: Inl, pos: Int, c: Int) -> Int
         if p.d_live >= p.opts.max_delims
             p.truncated = true
         else
-            push_delim(p, id, c, n, can_open, can_close)
+            push_delim(var p, id, c, n, can_open, can_close)
     pos + n
 
 fn push_delim(var p: Inl, node: Int, c: Int, n: Int, can_open: Bool, can_close: Bool)
@@ -487,17 +487,17 @@ fn process_emphasis(var p: Inl, bottom: Int)
             opener = p.d_prev[opener]
         let old = closer
         if found
-            closer = insert_emph(p, opener, closer)
+            closer = insert_emph(var p, opener, closer)
         else
             floors.set(key, p.d_prev[old])
             let nx = p.d_next[old]
             if not p.d_open[old]
-                remove_delim(p, old)
+                remove_delim(var p, old)
             closer = nx
     for _ in 0..list.len(p.d_node)
         if p.d_top < 0 or p.d_top == bottom
             break
-        remove_delim(p, p.d_top)
+        remove_delim(var p, p.d_top)
 
 fn first_delim(p: Inl) -> Int
     var d = p.d_top
@@ -539,24 +539,24 @@ fn insert_emph(var p: Inl, opener: Int, closer: Int) -> Int
         i_strong()
     else
         i_emph()
-    let emph = new_node(p, kind, p.e[o_node], p.s[c_node])
-    insert_after(p, o_node, emph)
-    move_between(p, emph, c_node, emph)
+    let emph = new_node(var p, kind, p.e[o_node], p.s[c_node])
+    insert_after(var p, o_node, emph)
+    move_between(var p, emph, c_node, emph)
     // The delimiters between the two are inside the emphasis now.
     var d = p.d_prev[closer]
     for _ in 0..list.len(p.d_node)
         if d < 0 or d == opener
             break
         let pv = p.d_prev[d]
-        remove_delim(p, d)
+        remove_delim(var p, d)
         d = pv
     if p.d_num[opener] == 0
-        detach(p, o_node)
-        remove_delim(p, opener)
+        detach(var p, o_node)
+        remove_delim(var p, opener)
     if p.d_num[closer] == 0
-        detach(p, c_node)
+        detach(var p, c_node)
         let nx = p.d_next[closer]
-        remove_delim(p, closer)
+        remove_delim(var p, closer)
         return nx
     closer
 
@@ -583,12 +583,12 @@ fn push_bracket(var p: Inl, node: Int, image: Bool, after: Int)
 
 fn close_bracket(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
     if p.b_count == 0
-        add(p, i_text(), pos, pos + 1)
+        add(var p, i_text(), pos, pos + 1)
         return pos + 1
     let top = p.b_count - 1
     if not p.b_active[top]
         p.b_count = top
-        add(p, i_text(), pos, pos + 1)
+        add(var p, i_text(), pos, pos + 1)
         return pos + 1
     let opener = p.b_node[top]
     let image = p.b_image[top]
@@ -660,20 +660,20 @@ fn close_bracket(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
                     pass
     if not matched
         p.b_count = top
-        add(p, i_text(), pos, pos + 1)
+        add(var p, i_text(), pos, pos + 1)
         return pos + 1
-    let link = new_node(p, (if image then i_image() else i_link()), p.s[opener], end)
+    let link = new_node(var p, (if image then i_image() else i_link()), p.s[opener], end)
     p.dest0[link] = d0
     p.dest1[link] = d1
     p.title0[link] = t0
     p.title1[link] = t1
     p.from_ref[link] = by_ref
-    insert_after(p, opener, link)
-    move_between(p, link, -1, link)
-    detach(p, opener)
+    insert_after(var p, opener, link)
+    move_between(var p, link, -1, link)
+    detach(var p, opener)
     if not image
-        unwrap_autolinks(p, link)
-    process_emphasis(p, p.b_delim[top])
+        unwrap_autolinks(var p, link)
+    process_emphasis(var p, p.b_delim[top])
     p.b_count = top
     if not image
         for k in 0..top
@@ -694,7 +694,7 @@ fn footnote_ref(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
         return pos
     if not blocks.foot_index.has(mdscan.label_key(str.slice(p.text, pos + 2, k)))
         return pos
-    let id = add(p, i_footref(), pos, k + 1)
+    let id = add(var p, i_footref(), pos, k + 1)
     p.dest0[id] = mdscan.to_source(p.g, pos + 2)
     p.dest1[id] = mdscan.to_source(p.g, k)
     k + 1
@@ -706,9 +706,9 @@ fn footnote_ref(var p: Inl, blocks: mdblock.Blocks, pos: Int) -> Int
 fn smart(var p: Inl, pos: Int, c: Int) -> Int
     if c == '.'
         if peek(p, pos + 1) == '.' and peek(p, pos + 2) == '.'
-            add_char(p, 0x2026, pos, pos + 3)
+            add_char(var p, 0x2026, pos, pos + 3)
             return pos + 3
-        add(p, i_text(), pos, pos + 1)
+        add(var p, i_text(), pos, pos + 1)
         return pos + 1
     if c == '-'
         var n = 0
@@ -717,7 +717,7 @@ fn smart(var p: Inl, pos: Int, c: Int) -> Int
                 break
             n = n + 1
         if n == 1
-            add(p, i_text(), pos, pos + 1)
+            add(var p, i_text(), pos, pos + 1)
             return pos + 1
         var em = 0
         var en = 0
@@ -732,9 +732,9 @@ fn smart(var p: Inl, pos: Int, c: Int) -> Int
             en = 2
             em = (n - 4) / 3
         for _ in 0..em
-            add_char(p, 0x2014, pos, pos + n)
+            add_char(var p, 0x2014, pos, pos + n)
         for _ in 0..en
-            add_char(p, 0x2013, pos, pos + n)
+            add_char(var p, 0x2013, pos, pos + n)
         return pos + n
     let before = mdscan.decode_before(p.text, pos)
     let after = if pos + 1 >= p.n
@@ -744,9 +744,9 @@ fn smart(var p: Inl, pos: Int, c: Int) -> Int
     let opens = not mdscan.unicode_whitespace(after)
                 and (mdscan.unicode_whitespace(before) or mdscan.unicode_punctuation(before))
     if c == '"'
-        add_char(p, (if opens then 0x201C else 0x201D), pos, pos + 1)
+        add_char(var p, (if opens then 0x201C else 0x201D), pos, pos + 1)
     else
-        add_char(p, (if opens then 0x2018 else 0x2019), pos, pos + 1)
+        add_char(var p, (if opens then 0x2018 else 0x2019), pos, pos + 1)
     pos + 1
 
 // ── Extended autolinks (GFM section 6.9) ──────────────────────────────
@@ -773,7 +773,7 @@ fn autolink_candidates(t: Str, n: Int) -> HashMap<Int, (Int, Int)>
 // The extended autolink starting at `pos`.
 fn extended(var p: Inl, pos: Int) -> Int
     let c = p.cands.get(pos) ?? (pos + 1, 2)
-    let link = add(p, i_link(), pos, c.0)
+    let link = add(var p, i_link(), pos, c.0)
     p.dest0[link] = mdscan.to_source(p.g, pos)
     p.dest1[link] = mdscan.to_source(p.g, c.0)
     p.title0[link] = p.dest1[link]
@@ -785,8 +785,8 @@ fn extended(var p: Inl, pos: Int) -> Int
     else
         ""
     p.auto[link] = true
-    let inner = new_node(p, i_text(), pos, c.0)
-    append(p, link, inner)
+    let inner = new_node(var p, i_text(), pos, c.0)
+    append(var p, link, inner)
     c.0
 
 // Whether an autolink may begin at `k`: at the start, or after
@@ -938,9 +938,9 @@ fn unwrap_autolinks(var p: Inl, link: Int)
         let nx = p.next[c]
         if p.kind[c] == i_link() and p.auto[c]
             let inner = p.first[c]
-            detach(p, inner)
-            insert_after(p, c, inner)
-            detach(p, c)
+            detach(var p, inner)
+            insert_after(var p, c, inner)
+            detach(var p, c)
         elif p.first[c] >= 0
-            unwrap_autolinks(p, c)
+            unwrap_autolinks(var p, c)
         c = nx

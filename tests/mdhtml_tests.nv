@@ -278,7 +278,7 @@ fn test_the_renderer_appends_rather_than_allocating() [io]
 
     test.case("and a second page appends to the first rather than replacing it")
     let before = list.len(one)
-    let two = mdhtml.render(one, "b\n", o)
+    let two = mdhtml.render(var one, "b\n", o)
     test.assert(list.len(two) > before)
     test.assert(bytes.byte_list_to_str(two) == "<p>a</p>\n<p>b</p>\n")
 

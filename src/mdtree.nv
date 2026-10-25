@@ -371,12 +371,12 @@ fn subtree_events(doc: MdDoc, index: Int) -> [mdparse.MdEvent]
     var out: [mdparse.MdEvent] = []
     if index < 0 or index >= list.len(doc.nodes)
         return out
-    open_event(doc, index, out)
+    open_event(doc, index, var out)
     var c = doc.nodes[index].first_child
     for _ in 0..list.len(doc.nodes)
         if c == NO_NODE
             break
-        open_event(doc, c, out)
+        open_event(doc, c, var out)
         let n = doc.nodes[c]
         if n.first_child != NO_NODE
             c = n.first_child
@@ -389,11 +389,11 @@ fn subtree_events(doc: MdDoc, index: Int) -> [mdparse.MdEvent]
                 break
             up = doc.nodes[up].parent
             if up != index and up != NO_NODE
-                close_event(doc, up, out)
+                close_event(doc, up, var out)
         if up == index or up == NO_NODE
             break
         c = doc.nodes[up].next_sibling
-    close_event(doc, index, out)
+    close_event(doc, index, var out)
     out
 
 fn open_event(doc: MdDoc, id: Int, var out: [mdparse.MdEvent])

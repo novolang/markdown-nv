@@ -289,7 +289,7 @@ pub fn parser_with(source: Str, options: MdOptions) -> MdParser []
     let st = mdblock.parse(source, bo)
     var em = Emitter { source: source, options: options, blocks: st, events: [], spans: [],
                        truncated: st.truncated }
-    emit_block(em, 0)
+    emit_block(var em, 0)
     var defs: [MdRange] = []
     for r in st.ref_label
         list.push(defs, MdRange { start: r.0, end: r.1 })
@@ -464,7 +464,7 @@ fn push_text(var em: Emitter, a: Int, e: Int)
                     return
             _         =>
                 pass
-    push(em, MdText(MdRange { start: a, end: e }), a, e)
+    push(var em, MdText(MdRange { start: a, end: e }), a, e)
 
 fn range(a: Int, e: Int) -> MdRange
     MdRange { start: a, end: e }
@@ -492,42 +492,42 @@ fn emit_block(var em: Emitter, id: Int)
     let a = st.start[id]
     let e = st.stop[id]
     if k == mdblock.k_doc()
-        emit_children(em, id)
+        emit_children(var em, id)
     elif k == mdblock.k_para()
-        push(em, MdStart(TagParagraph), a, e)
-        emit_paragraph(em, id)
-        push(em, MdEnd(TagParagraph), a, e)
+        push(var em, MdStart(TagParagraph), a, e)
+        emit_paragraph(var em, id)
+        push(var em, MdEnd(TagParagraph), a, e)
     elif k == mdblock.k_heading()
-        emit_heading(em, id)
+        emit_heading(var em, id)
     elif k == mdblock.k_fenced() or k == mdblock.k_indented()
         let info = range(st.r0[id], st.r1[id])
         let tag = if k == mdblock.k_fenced()
             TagCodeBlock(CodeFenced(info))
         else
             TagCodeBlock(CodeIndented)
-        push(em, MdStart(tag), a, e)
+        push(var em, MdStart(tag), a, e)
         for ln in st.l0[id]..st.l1[id]
-            emit_line(em, ln, true)
-        push(em, MdEnd(tag), a, e)
+            emit_line(var em, ln, true)
+        push(var em, MdEnd(tag), a, e)
     elif k == mdblock.k_html()
         for ln in st.l0[id]..st.l1[id]
-            emit_line(em, ln, false)
+            emit_line(var em, ln, false)
     elif k == mdblock.k_rule()
-        push(em, MdRule, a, e)
+        push(var em, MdRule, a, e)
     elif k == mdblock.k_table()
-        emit_table(em, id)
+        emit_table(var em, id)
     else
         let tag = block_tag(em, id)
-        push(em, MdStart(tag), a, e)
-        emit_children(em, id)
-        push(em, MdEnd(tag), a, e)
+        push(var em, MdStart(tag), a, e)
+        emit_children(var em, id)
+        push(var em, MdEnd(tag), a, e)
 
 fn emit_children(var em: Emitter, id: Int)
     var c = em.blocks.first[id]
     for _ in 0..list.len(em.blocks.kind)
         if c < 0
             break
-        emit_block(em, c)
+        emit_block(var em, c)
         c = em.blocks.next[c]
 
 // One line of a code block or an HTML block: the spaces a partly
@@ -535,7 +535,7 @@ fn emit_children(var em: Emitter, id: Int)
 fn emit_line(var em: Emitter, ln: Int, code: Bool)
     let st = em.blocks
     for _ in 0..st.ln_pad[ln]
-        push(em, MdChar(' '), st.ln_start[ln], st.ln_start[ln])
+        push(var em, MdChar(' '), st.ln_start[ln], st.ln_start[ln])
     let s = st.ln_start[ln]
     let e = st.ln_end[ln]
     let lf = st.ln_join[ln] == 1 and str.byte_at_or(em.source, e, 0) == '\n'
@@ -548,9 +548,9 @@ fn emit_line(var em: Emitter, ln: Int, code: Bool)
             MdCode(range(s, end))
         else
             MdHtml(range(s, end))
-        push(em, ev, s, end)
+        push(var em, ev, s, end)
     if code and not lf
-        push(em, MdChar('\n'), e, e)
+        push(var em, MdChar('\n'), e, e)
 
 // The lines of leaf `id` as joined text, from `from` in the first line
 // and to `to` in the last, or to each line's end when `to` is -1.
@@ -586,9 +586,9 @@ fn emit_paragraph(var em: Emitter, id: Int)
             and st.kind[st.parent[id]] == mdblock.k_item()
         let t = task_marker(em.source, from, st.ln_end[st.l0[id]])
         if t > 0
-            push(em, MdTaskMarker(t == 2), from, from + 3)
+            push(var em, MdTaskMarker(t == 2), from, from + 3)
             from = from + 3
-    emit_inline(em, leaf_text(em, id, from, -1))
+    emit_inline(var em, leaf_text(em, id, from, -1))
 
 // A task list marker `[ ]`, `[x]` or `[X]` at `a`, followed by a space
 // or the end of the line: 1 unchecked, 2 checked, or 0.
@@ -624,12 +624,12 @@ fn emit_heading(var em: Emitter, id: Int)
             anchor = range(found.0, found.1)
             text_end = found.2
     let tag = TagHeading(st.a[id], anchor)
-    push(em, MdStart(tag), st.start[id], st.stop[id])
+    push(var em, MdStart(tag), st.start[id], st.stop[id])
     if setext
-        emit_inline(em, leaf_text(em, id, cs, text_end))
+        emit_inline(var em, leaf_text(em, id, cs, text_end))
     else
-        emit_inline(em, mdscan.segs(em.source, [cs], [text_end], [0]))
-    push(em, MdEnd(tag), st.start[id], st.stop[id])
+        emit_inline(var em, mdscan.segs(em.source, [cs], [text_end], [0]))
+    push(var em, MdEnd(tag), st.start[id], st.stop[id])
 
 // A `{#id}` at the end of a heading's content `[a, e)`, as `(id start,
 // id end, where the heading text now ends)`, or a start of -1.  It must
@@ -682,7 +682,7 @@ fn emit_table(var em: Emitter, id: Int)
     let a = st.start[id]
     let e = st.stop[id]
     let columns = list.len(aligns)
-    push(em, MdStart(tag), a, e)
+    push(var em, MdStart(tag), a, e)
     for ln in st.l0[id]..st.l1[id]
         let head = ln == st.l0[id]
         let ls = st.ln_start[ln]
@@ -691,19 +691,19 @@ fn emit_table(var em: Emitter, id: Int)
         else
             TagTableRow
         let row_end = st.ln_end[ln] + st.ln_join[ln]
-        push(em, MdStart(row_tag), ls, row_end)
+        push(var em, MdStart(row_tag), ls, row_end)
         let cells = mdblock.row_cells(em.source, ls, st.ln_end[ln])
         for c in 0..columns
             if c < list.len(cells)
                 let cell = cells[c]
-                push(em, MdStart(TagTableCell), cell.0, cell.1)
-                emit_inline(em, cell_text(em.source, cell.0, cell.1))
-                push(em, MdEnd(TagTableCell), cell.0, cell.1)
+                push(var em, MdStart(TagTableCell), cell.0, cell.1)
+                emit_inline(var em, cell_text(em.source, cell.0, cell.1))
+                push(var em, MdEnd(TagTableCell), cell.0, cell.1)
             else
-                push(em, MdStart(TagTableCell), st.ln_end[ln], st.ln_end[ln])
-                push(em, MdEnd(TagTableCell), st.ln_end[ln], st.ln_end[ln])
-        push(em, MdEnd(row_tag), ls, row_end)
-    push(em, MdEnd(tag), a, e)
+                push(var em, MdStart(TagTableCell), st.ln_end[ln], st.ln_end[ln])
+                push(var em, MdEnd(TagTableCell), st.ln_end[ln], st.ln_end[ln])
+        push(var em, MdEnd(row_tag), ls, row_end)
+    push(var em, MdEnd(tag), a, e)
 
 // A table cell's text with the backslash of every `\|` left out, since
 // the pipe is the cell's own text even inside a code span.
@@ -749,7 +749,7 @@ fn emit_inline(var em: Emitter, g: mdscan.Segs)
                            or p.kind[id] == mdinline.i_image()
         if not entered[n - 1] and is_container
             entered[n - 1] = true
-            push(em, MdStart(inline_tag(p, id)), mdscan.to_source(g, p.s[id]),
+            push(var em, MdStart(inline_tag(p, id)), mdscan.to_source(g, p.s[id]),
                  mdscan.to_source(g, p.e[id]))
             let child = p.first[id]
             if child >= 0
@@ -757,10 +757,10 @@ fn emit_inline(var em: Emitter, g: mdscan.Segs)
                 list.push(entered, false)
             continue
         if is_container
-            push(em, MdEnd(inline_tag(p, id)), mdscan.to_source(g, p.s[id]),
+            push(var em, MdEnd(inline_tag(p, id)), mdscan.to_source(g, p.s[id]),
                  mdscan.to_source(g, p.e[id]))
         else
-            emit_leaf(em, p, g, id)
+            emit_leaf(var em, p, g, id)
         stack = stack[0:n - 1]
         entered = entered[0:n - 1]
         let nx = p.next[id]
@@ -790,18 +790,18 @@ fn emit_leaf(var em: Emitter, p: mdinline.Inl, g: mdscan.Segs, id: Int)
     let e = mdscan.to_source(g, p.e[id])
     if k == mdinline.i_text()
         for piece in mdscan.source_pieces(g, p.s[id], p.e[id])
-            push_text(em, piece.0, piece.1)
+            push_text(var em, piece.0, piece.1)
     elif k == mdinline.i_char()
-        push(em, MdChar(p.ch[id]), a, e)
+        push(var em, MdChar(p.ch[id]), a, e)
     elif k == mdinline.i_code()
         for piece in mdscan.source_pieces(g, p.s[id], p.e[id])
-            push(em, MdCode(range(piece.0, piece.1)), piece.0, piece.1)
+            push(var em, MdCode(range(piece.0, piece.1)), piece.0, piece.1)
     elif k == mdinline.i_html()
         for piece in mdscan.source_pieces(g, p.s[id], p.e[id])
-            push(em, MdHtml(range(piece.0, piece.1)), piece.0, piece.1)
+            push(var em, MdHtml(range(piece.0, piece.1)), piece.0, piece.1)
     elif k == mdinline.i_soft()
-        push(em, MdSoftBreak, a, e)
+        push(var em, MdSoftBreak, a, e)
     elif k == mdinline.i_hard()
-        push(em, MdHardBreak, a, e)
+        push(var em, MdHardBreak, a, e)
     else
-        push(em, MdFootnoteRef(range(p.dest0[id], p.dest1[id])), a, e)
+        push(var em, MdFootnoteRef(range(p.dest0[id], p.dest1[id])), a, e)

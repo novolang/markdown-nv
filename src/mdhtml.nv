@@ -149,7 +149,7 @@ pub fn commonmark_options() -> MdHtmlOptions []
 // ```
 pub fn render(var out: [u8], source: Str, options: MdHtmlOptions) -> [u8] []
     let p = mdparse.parser_with(source, options.markdown)
-    write_events(out, source, p.events, options)
+    write_events(var out, source, p.events, options)
 
 // render_events appends the HTML for a list of events, read against
 // the source of the parser that made them.  For a caller that filtered
@@ -166,7 +166,7 @@ pub fn render(var out: [u8], source: Str, options: MdHtmlOptions) -> [u8] []
 // ```
 pub fn render_events(var out: [u8], p: mdparse.MdParser, events: [mdparse.MdEvent],
                      options: MdHtmlOptions) -> [u8] []
-    write_events(out, p.source, events, options)
+    write_events(var out, p.source, events, options)
 
 // render_tree appends the HTML for one node of a tree and everything
 // under it; the document node renders the whole document.
@@ -181,7 +181,7 @@ pub fn render_events(var out: [u8], p: mdparse.MdParser, events: [mdparse.MdEven
 // println(str.from_int(list.len(out)))
 // ```
 pub fn render_tree(var out: [u8], doc: mdtree.MdDoc, index: Int, options: MdHtmlOptions) -> [u8] []
-    write_events(out, doc.source, mdtree.subtree_events(doc, index), options)
+    write_events(var out, doc.source, mdtree.subtree_events(doc, index), options)
 
 // render_str is `render` into a new string.
 //
@@ -192,7 +192,7 @@ pub fn render_tree(var out: [u8], doc: mdtree.MdDoc, index: Int, options: MdHtml
 // ```
 pub fn render_str(source: Str, options: MdHtmlOptions) -> Str []
     var out: [u8] = []
-    render(out, source, options)
+    render(var out, source, options)
     bytes.byte_list_to_str(out)
 
 // escape_text appends text with `&`, `<`, `>` and `"` escaped, the
@@ -206,7 +206,7 @@ pub fn render_str(source: Str, options: MdHtmlOptions) -> Str []
 // print(bytes.byte_list_to_str(out))   // a&lt;b
 // ```
 pub fn escape_text(var out: [u8], text: Str) -> [u8] []
-    put(out, escaped(text, false))
+    put(var out, escaped(text, false))
     out
 
 // escape_attr appends text with `&`, `<`, `>`, `"` and `'` escaped,
@@ -220,7 +220,7 @@ pub fn escape_text(var out: [u8], text: Str) -> [u8] []
 // print(bytes.byte_list_to_str(out))   // a&quot;b
 // ```
 pub fn escape_attr(var out: [u8], text: Str) -> [u8] []
-    put(out, escaped(text, true))
+    put(var out, escaped(text, true))
     out
 
 // heading_id is the anchor a heading gets: its text lowercased, with
@@ -288,7 +288,7 @@ pub fn to_plain(var out: [u8], source: Str, options: mdparse.MdOptions) -> [u8] 
                     list.push(parts, "\n")
             _           =>
                 pass
-    put(out, str.join(parts, ""))
+    put(var out, str.join(parts, ""))
     out
 
 fn block_end(tag: mdparse.MdTag) -> Bool
@@ -378,7 +378,7 @@ fn w(var wr: Writer, s: Str)
 // A line ending, unless the output is already at the start of a line.
 fn cr(var wr: Writer)
     if not wr.at_line_start
-        w(wr, "\n")
+        w(var wr, "\n")
 
 fn text(wr: Writer, r: mdparse.MdRange) -> Str
     str.slice(wr.source, r.start, r.end)
@@ -394,8 +394,8 @@ fn write_events(var out: [u8], source: Str, events: [mdparse.MdEvent], o: MdHtml
                       tags: [], plain_depth: 0, column: 0, aligns: [], body_open: false, seen: [],
                       notes: [] }
     for i in 0..list.len(events)
-        write_event(wr, i)
-    put(out, str.join(wr.parts, ""))
+        write_event(var wr, i)
+    put(var out, str.join(wr.parts, ""))
     out
 
 fn top_tag(wr: Writer, depth: Int) -> ?mdparse.MdTag
@@ -465,44 +465,44 @@ fn next_is(wr: Writer, i: Int, code: Bool) -> Bool
 fn write_event(var wr: Writer, i: Int)
     match wr.events[i]
         MdStart(tag)       =>
-            start_tag(wr, tag, i)
+            start_tag(var wr, tag, i)
             list.push(wr.tags, tag)
         MdEnd(tag)         =>
             wr.tags = wr.tags[0:list.len(wr.tags) - 1]
-            end_tag(wr, tag)
+            end_tag(var wr, tag)
         MdText(r)          =>
-            w(wr, escaped(text(wr, r), false))
+            w(var wr, escaped(text(wr, r), false))
         MdChar(c)          =>
-            w(wr, escaped(str.from_char(c), false))
+            w(var wr, escaped(str.from_char(c), false))
         MdCode(r)          =>
-            write_code(wr, i, r)
+            write_code(var wr, i, r)
         MdHtml(r)          =>
-            write_html(wr, i, r)
+            write_html(var wr, i, r)
         MdSoftBreak        =>
             let soft = if wr.plain_depth > 0
                 " "
             else
                 "\n"
-            w(wr, soft)
+            w(var wr, soft)
         MdHardBreak        =>
             let hard = if wr.plain_depth > 0
                 " "
             else
                 "<br" + void_end(wr) + "\n"
-            w(wr, hard)
+            w(var wr, hard)
         MdRule             =>
-            cr(wr)
-            w(wr, "<hr" + void_end(wr) + "\n")
+            cr(var wr)
+            w(var wr, "<hr" + void_end(wr) + "\n")
         MdTaskMarker(done) =>
             let checked = if done
                 "checked=\"\" "
             else
                 ""
-            w(wr, "<input " + checked + "disabled=\"\" type=\"checkbox\">")
+            w(var wr, "<input " + checked + "disabled=\"\" type=\"checkbox\">")
         MdFootnoteRef(l)   =>
-            let n = note_number(wr, text(wr, l))
+            let n = note_number(var wr, text(wr, l))
             let id = escaped(mdscan.label_key(text(wr, l)), true)
-            w(wr, "<sup class=\"footnote-ref\"><a href=\"#fn-" + id + "\" id=\"fnref-" + id + "\">"
+            w(var wr, "<sup class=\"footnote-ref\"><a href=\"#fn-" + id + "\" id=\"fnref-" + id + "\">"
                   + str.from_int(n) + "</a></sup>")
 
 fn note_number(var wr: Writer, label: Str) -> Int
@@ -519,23 +519,23 @@ fn write_code(var wr: Writer, i: Int, r: mdparse.MdRange)
         Some(TagCodeBlock(_)) => true
         _                     => false
     if in_block
-        w(wr, escaped(raw, false))
+        w(var wr, escaped(raw, false))
         return
     let flat = str.replace_all(str.replace_all(str.replace_all(raw, "\r\n", " "), "\n", " "), "\r", " ")
     if wr.plain_depth > 0
-        w(wr, escaped(flat, false))
+        w(var wr, escaped(flat, false))
         return
     if not prev_is(wr, i, true)
-        w(wr, "<code>")
-    w(wr, escaped(flat, false))
+        w(var wr, "<code>")
+    w(var wr, escaped(flat, false))
     if not next_is(wr, i, true)
-        w(wr, "</code>")
+        w(var wr, "</code>")
 
 fn write_html(var wr: Writer, i: Int, r: mdparse.MdRange)
     let raw = text(wr, r)
     let inline = inline_context(wr)
     if wr.plain_depth > 0
-        w(wr, escaped(raw, false))
+        w(var wr, escaped(raw, false))
         return
     match wr.o.raw_html
         RawDrop =>
@@ -543,14 +543,14 @@ fn write_html(var wr: Writer, i: Int, r: mdparse.MdRange)
         _       =>
             pass
     if not inline and not prev_is(wr, i, false)
-        cr(wr)
+        cr(var wr)
     match wr.o.raw_html
         RawPass =>
-            w(wr, raw)
+            w(var wr, raw)
         _       =>
-            w(wr, escaped(raw, false))
+            w(var wr, escaped(raw, false))
     if not inline and not next_is(wr, i, false)
-        cr(wr)
+        cr(var wr)
 
 // The destination of a link as written into the page: its prefix, then
 // the destination with its escapes resolved, checked against the rule.
@@ -583,44 +583,44 @@ fn start_tag(var wr: Writer, tag: mdparse.MdTag, i: Int)
     match tag
         TagParagraph              =>
             if not tight_paragraph(wr)
-                cr(wr)
-                w(wr, "<p>")
+                cr(var wr)
+                w(var wr, "<p>")
         TagHeading(level, anchor) =>
-            cr(wr)
-            w(wr, "<h" + str.from_int(level) + heading_attr(wr, anchor, i) + ">")
+            cr(var wr)
+            w(var wr, "<h" + str.from_int(level) + heading_attr(var wr, anchor, i) + ">")
         TagBlockQuote             =>
-            cr(wr)
-            w(wr, "<blockquote>\n")
+            cr(var wr)
+            w(var wr, "<blockquote>\n")
         TagCodeBlock(kind)        =>
-            cr(wr)
-            w(wr, "<pre><code" + language_attr(wr, kind) + ">")
+            cr(var wr)
+            w(var wr, "<pre><code" + language_attr(wr, kind) + ">")
         TagList(kind, _)          =>
-            cr(wr)
+            cr(var wr)
             match kind
                 ListBullet(_)     =>
-                    w(wr, "<ul>\n")
+                    w(var wr, "<ul>\n")
                 ListOrdered(n, _) =>
                     let open = if n == 1
                         "<ol>\n"
                     else
                         "<ol start=\"" + str.from_int(n) + "\">\n"
-                    w(wr, open)
+                    w(var wr, open)
         TagItem                   =>
-            cr(wr)
-            w(wr, "<li>")
+            cr(var wr)
+            w(var wr, "<li>")
         TagTable(aligns)          =>
-            cr(wr)
-            w(wr, "<table>\n")
+            cr(var wr)
+            w(var wr, "<table>\n")
             wr.aligns = aligns[:]
             wr.body_open = false
         TagTableHead              =>
-            w(wr, "<thead>\n<tr>\n")
+            w(var wr, "<thead>\n<tr>\n")
             wr.column = 0
         TagTableRow               =>
             if not wr.body_open
-                w(wr, "<tbody>\n")
+                w(var wr, "<tbody>\n")
                 wr.body_open = true
-            w(wr, "<tr>\n")
+            w(var wr, "<tr>\n")
             wr.column = 0
         TagTableCell              =>
             let head = match top_tag(wr, 0)
@@ -630,22 +630,22 @@ fn start_tag(var wr: Writer, tag: mdparse.MdTag, i: Int)
                 "<th"
             else
                 "<td"
-            w(wr, cell + align_attr(wr) + ">")
+            w(var wr, cell + align_attr(wr) + ">")
         TagEmphasis               =>
-            w(wr, "<em>")
+            w(var wr, "<em>")
         TagStrong                 =>
-            w(wr, "<strong>")
+            w(var wr, "<strong>")
         TagStrikethrough          =>
-            w(wr, "<del>")
+            w(var wr, "<del>")
         TagLink(l)                =>
-            w(wr, "<a href=\"" + destination(wr, l) + "\"" + title_attr(wr, l) + ">")
+            w(var wr, "<a href=\"" + destination(wr, l) + "\"" + title_attr(wr, l) + ">")
         TagImage(l)               =>
-            w(wr, "<img src=\"" + destination(wr, l) + "\" alt=\"")
+            w(var wr, "<img src=\"" + destination(wr, l) + "\" alt=\"")
             wr.plain_depth = 1
         TagFootnoteDefinition(l)  =>
-            cr(wr)
-            let n = note_number(wr, text(wr, l))
-            w(wr, "<div class=\"footnote-definition\" id=\"fn-"
+            cr(var wr)
+            let n = note_number(var wr, text(wr, l))
+            w(var wr, "<div class=\"footnote-definition\" id=\"fn-"
                   + escaped(mdscan.label_key(text(wr, l)), true)
                   + "\"><sup class=\"footnote-definition-label\">" + str.from_int(n) + "</sup>\n")
 
@@ -655,37 +655,37 @@ fn end_tag(var wr: Writer, tag: mdparse.MdTag)
             TagImage(l) =>
                 wr.plain_depth = wr.plain_depth - 1
                 if wr.plain_depth == 0
-                    w(wr, "\"" + title_attr(wr, l) + void_end(wr))
+                    w(var wr, "\"" + title_attr(wr, l) + void_end(wr))
             _           =>
                 pass
         return
     match tag
         TagParagraph             =>
             if not tight_paragraph(wr)
-                w(wr, "</p>\n")
+                w(var wr, "</p>\n")
         TagHeading(level, _)     =>
-            w(wr, "</h" + str.from_int(level) + ">\n")
+            w(var wr, "</h" + str.from_int(level) + ">\n")
         TagBlockQuote            =>
-            cr(wr)
-            w(wr, "</blockquote>\n")
+            cr(var wr)
+            w(var wr, "</blockquote>\n")
         TagCodeBlock(_)          =>
-            w(wr, "</code></pre>\n")
+            w(var wr, "</code></pre>\n")
         TagList(kind, _)         =>
             match kind
                 ListBullet(_)     =>
-                    w(wr, "</ul>\n")
+                    w(var wr, "</ul>\n")
                 ListOrdered(_, _) =>
-                    w(wr, "</ol>\n")
+                    w(var wr, "</ol>\n")
         TagItem                  =>
-            w(wr, "</li>\n")
+            w(var wr, "</li>\n")
         TagTable(_)              =>
             if wr.body_open
-                w(wr, "</tbody>\n")
-            w(wr, "</table>\n")
+                w(var wr, "</tbody>\n")
+            w(var wr, "</table>\n")
         TagTableHead             =>
-            w(wr, "</tr>\n</thead>\n")
+            w(var wr, "</tr>\n</thead>\n")
         TagTableRow              =>
-            w(wr, "</tr>\n")
+            w(var wr, "</tr>\n")
         TagTableCell             =>
             let head = match top_tag(wr, 0)
                 Some(TagTableHead) => true
@@ -694,21 +694,21 @@ fn end_tag(var wr: Writer, tag: mdparse.MdTag)
                 "</th>\n"
             else
                 "</td>\n"
-            w(wr, close)
+            w(var wr, close)
             wr.column = wr.column + 1
         TagEmphasis              =>
-            w(wr, "</em>")
+            w(var wr, "</em>")
         TagStrong                =>
-            w(wr, "</strong>")
+            w(var wr, "</strong>")
         TagStrikethrough         =>
-            w(wr, "</del>")
+            w(var wr, "</del>")
         TagLink(_)               =>
-            w(wr, "</a>")
+            w(var wr, "</a>")
         TagImage(_)              =>
             pass
         TagFootnoteDefinition(_) =>
-            cr(wr)
-            w(wr, "</div>\n")
+            cr(var wr)
+            w(var wr, "</div>\n")
 
 fn language_attr(wr: Writer, kind: mdparse.MdCodeKind) -> Str
     if not wr.o.code_language_class

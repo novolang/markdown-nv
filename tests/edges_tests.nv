@@ -37,7 +37,7 @@ fn with_limits(nesting: Int, refs: Int, delims: Int) -> mdparse.MdOptions
 
 fn plain(md: Str) -> Str
     var out: [u8] = []
-    mdhtml.to_plain(out, md, mdparse.gfm_options())
+    mdhtml.to_plain(var out, md, mdparse.gfm_options())
     bytes.byte_list_to_str(out)
 
 fn is_image(k: mdtree.MdNodeKind) -> Bool
@@ -245,7 +245,7 @@ fn test_the_renderer_options_one_at_a_time() [io]
 
     test.case("an apostrophe is escaped in an attribute and in an href")
     var out: [u8] = []
-    mdhtml.escape_attr(out, "a'b")
+    mdhtml.escape_attr(var out, "a'b")
     test.assert(bytes.byte_list_to_str(out) == "a&#39;b")
     test.assert(cm("[x](/a'b)\n") == "<p><a href=\"/a&#x27;b\">x</a></p>\n")
 
@@ -347,11 +347,11 @@ fn test_plain_text_and_the_tree_views() [io]
 
     test.case("one node renders alone, and a node out of range renders nothing")
     var out: [u8] = []
-    mdhtml.render_tree(out, doc, para, mdhtml.commonmark_options())
+    mdhtml.render_tree(var out, doc, para, mdhtml.commonmark_options())
     test.assert(bytes.byte_list_to_str(out)
                 == "<p><img src=\"/p\" alt=\"i\" /> a&amp;b<br />\nc</p>\n")
     var none: [u8] = []
-    mdhtml.render_tree(none, doc, 999, mdhtml.commonmark_options())
+    mdhtml.render_tree(var none, doc, 999, mdhtml.commonmark_options())
     test.assert(list.len(none) == 0)
 
     test.case("the line of an offset in an empty document is 1")
@@ -366,12 +366,12 @@ fn test_a_stream_a_caller_built_renders_as_written() [io]
     let link = MdLink { destination: r, title: MdRange { start: 0, end: 0 },
                         from_reference: false, prefix: "", autolink: false }
     var out: [u8] = []
-    mdhtml.render_events(out, p, [MdText(r), MdEnd(TagImage(link))], mdhtml.commonmark_options())
+    mdhtml.render_events(var out, p, [MdText(r), MdEnd(TagImage(link))], mdhtml.commonmark_options())
     test.assert(bytes.byte_list_to_str(out) == "ab")
 
     test.case("a cell past the table's alignments has no align attribute")
     var t: [u8] = []
-    mdhtml.render_events(t, p, [MdStart(TagTable([])), MdStart(TagTableRow), MdStart(TagTableCell),
+    mdhtml.render_events(var t, p, [MdStart(TagTable([])), MdStart(TagTableRow), MdStart(TagTableCell),
                                 MdText(r), MdEnd(TagTableCell), MdEnd(TagTableRow),
                                 MdEnd(TagTable([]))],
                                 mdhtml.commonmark_options())
@@ -405,7 +405,7 @@ fn test_the_last_corners() [io]
 
     test.case("a leaf renders alone, and the replay carries code, breaks and references")
     var leaf: [u8] = []
-    mdhtml.render_tree(leaf, doc, 2, mdhtml.commonmark_options())
+    mdhtml.render_tree(var leaf, doc, 2, mdhtml.commonmark_options())
     test.assert(bytes.byte_list_to_str(leaf) == "a ")
     let replay = mdtree.events(doc)
     let direct = mdparse.parser_with("a `c`\nb[^1]\n\n[^1]: n\n", mdparse.gfm_options()).events
